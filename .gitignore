@@ -5,4 +5,6 @@ habit-state.db*
 ~/.habit-daemon/
 .DS_Store
 *.log
-docs/
+docs/*
+!docs/decisions/
+!docs/decisions/**
