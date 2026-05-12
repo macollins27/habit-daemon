@@ -23,6 +23,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import type Database from "better-sqlite3";
 
 export interface Concept2Credentials {
   readonly client_id: string;
@@ -368,4 +369,49 @@ export async function fetchRowsBetween(
   }
 
   return allRows;
+}
+
+// Task 11: cache one day's Concept2 results into the sensor_signals table.
+//
+// The daemon polls Concept2 on a recurring schedule (Task 16 wires it up).
+// Each poll fetches the day's results and persists them as a single
+// sensor_signals row keyed by (source='concept2', payload_date=YYYY-MM-DD).
+// The deterministic id `concept2-YYYY-MM-DD` makes the row idempotently
+// queryable from feature builders without a secondary index.
+//
+// The payload is wrapped as `{results: [...]}` rather than a bare array so
+// future schema additions (e.g., fetch metadata, sync source markers) can be
+// added without breaking parsers that already read the `results` field.
+export interface SyncDateOptions {
+  readonly db: Database.Database;
+  readonly date: Date;
+  readonly credentials: Concept2Credentials;
+  readonly tokens: Concept2Tokens;
+  readonly fetchImpl?: typeof fetch;
+  readonly onTokensRefreshed?: (newTokens: Concept2Tokens) => void;
+}
+
+export async function syncDate(opts: SyncDateOptions): Promise<void> {
+  const payloadDate = toIsoDate(opts.date);
+
+  const results = await fetchRowsBetween({
+    from: opts.date,
+    to: opts.date,
+    credentials: opts.credentials,
+    tokens: opts.tokens,
+    fetchImpl: opts.fetchImpl,
+    onTokensRefreshed: opts.onTokensRefreshed,
+  });
+
+  const id = `concept2-${payloadDate}`;
+  const payloadJson = JSON.stringify({ results });
+  const fetchedAt = Date.now();
+
+  opts.db
+    .prepare(
+      `INSERT OR REPLACE INTO sensor_signals (
+        id, source, payload_date, payload_json, fetched_at
+      ) VALUES (?, 'concept2', ?, ?, ?)`
+    )
+    .run(id, payloadDate, payloadJson, fetchedAt);
 }
