@@ -1,5 +1,3 @@
-// scripts/lib/orchestrator/footer-schema.ts
-//
 // Zod schema for the structured output every dispatched subagent emits.
 // Passed to `claude -p --json-schema "<schema>"` so the runtime constrains
 // generation token-by-token (per Anthropic's structured-outputs constrained

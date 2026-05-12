@@ -1,5 +1,3 @@
-// scripts/lib/orchestrator/cron-parser.ts
-//
 // Hand-rolled minimal 5-field cron parser. Supports:
 //   - Standard 5-field expression: "minute hour dom month dow"
 //   - Each field: "*" | number | "*/N" | "N,M,P" | "N-M"
@@ -134,6 +132,10 @@ export function parseCronExpression(expr: string): CronExpr {
  * Compute the next time the cron expression matches at-or-after `from`,
  * scanning minute-by-minute up to `maxScanMinutes` (default 1 year).
  * Returns null if no match found in the scan window.
+ *
+ * Local time. Single-host, single-timezone deployment; cron strings are
+ * interpreted in the process timezone via `Date.prototype.get*` (not
+ * `getUTC*`). Changing this to UTC would silently misfire every schedule.
  */
 export function nextRun(expr: CronExpr, from: Date, maxScanMinutes = 366 * 24 * 60): Date | null {
   const cursor = new Date(from.getTime());

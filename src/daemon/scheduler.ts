@@ -1,5 +1,3 @@
-// scripts/lib/orchestrator/scheduler.ts
-//
 // Long-running scheduler loop. Reads schedules table, computes next run time
 // per row via cron-parser.ts, sleeps until the next due time, dispatches the
 // matching verb via spawn, updates last_run_iso + next_run_iso, repeats.

@@ -1,5 +1,3 @@
-// scripts/lib/orchestrator/heartbeat.ts
-//
 // Heartbeat write + staleness-check primitives per design v2 §13 + R7.
 //
 // Three-layer liveness shape:

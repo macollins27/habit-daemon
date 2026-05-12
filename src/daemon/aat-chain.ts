@@ -1,5 +1,3 @@
-// scripts/lib/orchestrator/aat-chain.ts
-//
 // IETF draft-sharif-agent-audit-trail-style hash-chain primitives.
 //
 // Each event in a session is canonicalized via JSON Canonicalization Scheme

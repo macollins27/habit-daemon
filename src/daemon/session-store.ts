@@ -1,5 +1,3 @@
-// scripts/lib/orchestrator/session-store.ts
-//
 // SQLite-backed implementation of Anthropic's SessionStore interface.
 // Append-only events table with hash-chain (per aat-chain.ts).
 // Sessions table tracks parent/child relationships for SDK forkSession.

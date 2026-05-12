@@ -1,5 +1,3 @@
-// scripts/lib/orchestrator/kill-switch.ts
-//
 // AgentManager-pattern kill switch (R7 lift, GCS→SQLite substrate swap).
 // Kill verb writes a kind="kill-request" actions row; orchestrator dispatch
 // loops poll isKillRequested between dispatches.

@@ -1,5 +1,3 @@
-// scripts/orchestrate/scheduler-daemon.ts
-//
 // Long-running scheduler entry point. Run via systemd (canonical) or
 // supervisord / pm2 (alternative). Polls the schedules table every minute,
 // dispatches due verbs, sd_notify's the watchdog every 60s, writes a

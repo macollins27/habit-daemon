@@ -1,5 +1,3 @@
-// scripts/lib/orchestrator/verify-footer.ts
-//
 // Parse the JSON envelope returned by `claude -p --output-format json` and
 // validate the structured_output payload against FooterSchema. Run cross-
 // field validation that JSON Schema cannot natively express. Verify write_set

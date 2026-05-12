@@ -1,5 +1,3 @@
-// scripts/lib/orchestrator/sdk-dispatch.ts
-//
 // Spawn a single `claude -p` subprocess with the canonical flag set
 // (--bare, --output-format json, --json-schema, --model, --max-turns,
 // --max-budget-usd, --allowedTools, optionally --mcp-config, optionally

@@ -1,5 +1,3 @@
-// scripts/lib/orchestrator/ledger.ts
-//
 // orchestrator state on top of SessionStore.
 // Tables: runs, dispatches, actions, cursors, findings, schedules.
 //
