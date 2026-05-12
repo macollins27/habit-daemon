@@ -63,20 +63,83 @@ function getCreateSql(db: Database.Database, table: string): string {
   return row.sql;
 }
 
-function captureSchema(dbPath: string): {
-  readonly schedules: readonly TableInfoRow[];
-  readonly sessionEvents: readonly TableInfoRow[];
-  readonly sessionEventsCheckSql: string;
-  readonly schedulesCheckSql: string;
-} {
+interface NamedSqlRow {
+  readonly name: string;
+  readonly sql: string;
+}
+
+interface TableSnapshot {
+  readonly columns: readonly TableInfoRow[];
+  readonly sql: string;
+}
+
+interface SchemaSnapshot {
+  readonly tables: Readonly<Record<string, TableSnapshot>>;
+  readonly indexes: readonly NamedSqlRow[];
+  readonly triggers: readonly NamedSqlRow[];
+}
+
+// Tables compared by the in-both-orders test. session_events and schedules
+// are the tables migration 003 touches; sessions is the FK target and is
+// owned by SessionStore.applySchema, so we compare it too to catch drift.
+const TRACKED_TABLES: readonly string[] = ["sessions", "schedules", "session_events"];
+
+/**
+ * Collapse whitespace in a SQL string so the in-both-orders comparison
+ * matches on semantics, not on indentation/line-break style. SQLite stores
+ * the verbatim CREATE-statement text in `sqlite_master.sql`; the migration-
+ * 003 SQL file uses 2-space column indentation while `SessionStore.applySchema`
+ * and `Ledger.applyLedgerSchema` build their DDL inside a template literal
+ * at 8-space indentation. Both are semantically identical SQL — a strict
+ * `toEqual` on the raw `sql` would flag the whitespace as drift.
+ */
+function normalizeSql(sql: string): string {
+  return sql.replace(/\s+/g, " ").trim();
+}
+
+function normalizeNamedSql(row: NamedSqlRow): NamedSqlRow {
+  return { name: row.name, sql: normalizeSql(row.sql) };
+}
+
+function captureSchema(dbPath: string): SchemaSnapshot {
   const db = openDatabase(dbPath);
   try {
-    return {
-      schedules: tableInfo(db, "schedules"),
-      sessionEvents: tableInfo(db, "session_events"),
-      sessionEventsCheckSql: getCreateSql(db, "session_events"),
-      schedulesCheckSql: getCreateSql(db, "schedules"),
-    };
+    const tables: Record<string, TableSnapshot> = {};
+    for (const t of TRACKED_TABLES) {
+      tables[t] = {
+        columns: tableInfo(db, t),
+        sql: normalizeSql(getCreateSql(db, t)),
+      };
+    }
+
+    // Filter: `sql IS NOT NULL` drops SQLite's auto-created PRIMARY KEY /
+    // UNIQUE indexes (sqlite_autoindex_*), which carry no explicit DDL and
+    // should not be part of the drift comparison.
+    const placeholders = TRACKED_TABLES.map(() => "?").join(",");
+    const indexes = (
+      db
+        .prepare(
+          `SELECT name, sql FROM sqlite_master
+           WHERE type = 'index'
+             AND tbl_name IN (${placeholders})
+             AND sql IS NOT NULL
+           ORDER BY name`,
+        )
+        .all(...TRACKED_TABLES) as NamedSqlRow[]
+    ).map(normalizeNamedSql);
+    const triggers = (
+      db
+        .prepare(
+          `SELECT name, sql FROM sqlite_master
+           WHERE type = 'trigger'
+             AND tbl_name IN (${placeholders})
+             AND sql IS NOT NULL
+           ORDER BY name`,
+        )
+        .all(...TRACKED_TABLES) as NamedSqlRow[]
+    ).map(normalizeNamedSql);
+
+    return { tables, indexes, triggers };
   } finally {
     db.close();
   }
@@ -222,15 +285,9 @@ describe("migration 003 — SessionStore.append round-trip with event_type", () 
 
       const rows = store.load("s1");
       expect(rows.length).toBe(1);
-      const row = rows[0] as typeof rows[0] & { readonly event_type: string | null };
-      // Anthropic SDK SessionStore.load returns an AatRecord; the underlying
-      // SQLite row stores event_type in the event_type column. Verify directly.
-      const direct = store.db
-        .prepare(
-          "SELECT event_type FROM session_events WHERE session_id = ? AND seq = 0",
-        )
-        .get("s1") as { event_type: string | null };
-      expect(direct.event_type).toBe("habit_completed");
+      const row = rows[0];
+      // load() now projects event_type via the eventType field on the row.
+      expect(row.eventType).toBe("habit_completed");
       // Existing AatRecord fields still populated.
       expect(row.hash).toBeTruthy();
       expect(row.trustLevel).toBe("L1");
@@ -287,18 +344,19 @@ describe("migration 003 — in-both-orders idempotence", () => {
     ledgerB.close();
     const orderBSchema = captureSchema(orderBPath);
 
-    // Column-by-column equivalence for schedules.
-    expect(orderASchema.schedules).toEqual(orderBSchema.schedules);
-    // Column-by-column equivalence for session_events.
-    expect(orderASchema.sessionEvents).toEqual(orderBSchema.sessionEvents);
-    // CHECK SQL contains every event_type value in both orderings.
+    // Full-snapshot equality across both orderings: tables (columns + DDL),
+    // explicitly-named indexes, and triggers. Any drift between
+    // SessionStore.applySchema / Ledger.applyLedgerSchema and migration 003
+    // is caught here, regardless of which artifact (column, index, trigger)
+    // drifted.
+    expect(orderASchema).toEqual(orderBSchema);
+
+    // Sanity checks on the shared snapshot content. These guard against the
+    // (unlikely) case where both orders converge on an *incorrect* schema.
     for (const t of ALL_EVENT_TYPES) {
-      expect(orderASchema.sessionEventsCheckSql).toContain(t);
-      expect(orderBSchema.sessionEventsCheckSql).toContain(t);
+      expect(orderASchema.tables.session_events.sql).toContain(t);
     }
-    // Schedules CREATE SQL contains dispatch_priority in both orderings.
-    expect(orderASchema.schedulesCheckSql).toContain("dispatch_priority");
-    expect(orderBSchema.schedulesCheckSql).toContain("dispatch_priority");
+    expect(orderASchema.tables.schedules.sql).toContain("dispatch_priority");
   });
 
   it("Order 1 end state allows SessionStore.append with a valid event_type", () => {

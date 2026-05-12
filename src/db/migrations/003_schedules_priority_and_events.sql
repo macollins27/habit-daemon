@@ -10,6 +10,9 @@
 -- record, and the Ledger/SessionStore files are the runtime schema
 -- creators. They must stay in sync; the migration-003.test.ts in-both-orders
 -- test guards against drift.
+--
+-- Adding a new event_type value (e.g., a Phase B classifier event) requires
+-- a table-rebuild migration (SQLite has no ALTER ... DROP/ADD CHECK).
 
 -- sessions table must exist before session_events FK can reference it.
 CREATE TABLE IF NOT EXISTS sessions (
@@ -20,6 +23,10 @@ CREATE TABLE IF NOT EXISTS sessions (
   status          TEXT NOT NULL CHECK(status IN ('active','completed','failed','aborted'))
 );
 
+-- Phase A assumes a fresh DB. A deployment that already has a schedules
+-- table without dispatch_priority would silently keep the old schema here
+-- (IF NOT EXISTS skips). For Phase B / production upgrade paths, write a
+-- separate migration that ALTERs the column in instead.
 CREATE TABLE IF NOT EXISTS schedules (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
   cron_expr           TEXT NOT NULL,

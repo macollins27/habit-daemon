@@ -20,6 +20,7 @@ export type SessionStatus = "active" | "completed" | "failed" | "aborted";
  * from the predecessor fork) that predate this typed taxonomy.
  */
 export type SessionEventType =
+  // Habit-flow events (8): lifecycle of a single habit run.
   | "habit_prompt_sent"
   | "habit_user_response"
   | "habit_proof_received"
@@ -28,6 +29,8 @@ export type SessionEventType =
   | "habit_skip_requested"
   | "habit_dodge_requested"
   | "proof_attempt_rejected"
+
+  // Proposal events (7): self-improvement proposal lifecycle.
   | "proposal_emitted"
   | "proposal_applied"
   | "proposal_rejected"
@@ -35,6 +38,8 @@ export type SessionEventType =
   | "proposal_discussion_message"
   | "proposal_resolved"
   | "plan_change_applied"
+
+  // Infrastructure events (1): non-habit, non-proposal signal.
   | "sensor_failure_logged";
 
 export interface SessionRow {
@@ -48,6 +53,11 @@ export interface SessionRow {
 export interface SessionEventRow extends AatRecord {
   readonly id: number;
   readonly sessionId: string;
+  // Nullable because the SQLite CHECK constraint is "NULL OR IN (16 values)"
+  // — rows predating the typed taxonomy (or written via raw SQL without an
+  // event_type) carry NULL. New rows written via append() always carry a
+  // typed literal.
+  readonly eventType: SessionEventType | null;
 }
 
 export interface AppendOptions {
@@ -198,7 +208,8 @@ export class SessionStore {
     const rows = this.db
       .prepare(
         `SELECT id, session_id AS sessionId, seq, event_json AS eventJson,
-                prev_hash AS prevHash, hash, trust_level AS trustLevel, written_iso AS writtenIso
+                prev_hash AS prevHash, hash, trust_level AS trustLevel,
+                event_type AS eventType, written_iso AS writtenIso
          FROM session_events
          WHERE session_id = ?
          ORDER BY seq ASC`,
