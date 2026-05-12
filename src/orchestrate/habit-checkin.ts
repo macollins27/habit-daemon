@@ -550,6 +550,16 @@ export async function runHabitCheckin(
   }
 
   const levelTemplate = selectLevelTemplate(currentLevel, { wellSelection });
+
+  // Fail-fast cadence lookup: resolve the (habit, level) → delta minutes
+  // entry BEFORE we dispatch the model or post to Discord. Both
+  // selectLevelTemplate above and getEscalationDeltaMinutes here throw for
+  // unsupported (habit, level) combinations (e.g. wind-down L4); doing both
+  // lookups upfront keeps the verb side-effect-free when an invalid combo
+  // is asked for. The resolved delta is reused below to compute
+  // nextEscalationAt — single call, single source of truth.
+  const deltaMinutes = getEscalationDeltaMinutes(habit.id, currentLevel);
+
   const recentEvents = loadRecentEventsForHabit(sessionStore, habit.id);
 
   const prompt = buildHabitCheckinPrompt({
@@ -605,11 +615,10 @@ export async function runHabitCheckin(
   // ---------------------------------------------------------------------------
   // 7. Persist atomic state changes.
   //
-  //    Compute nextEscalationAt from the per-habit table — the model's
-  //    suggested next_check_in_iso is ignored in Phase A (design § 3 owns
-  //    cadence).
+  //    `deltaMinutes` was resolved upfront (fail-fast at step 3) — the
+  //    model's suggested next_check_in_iso is ignored in Phase A (design
+  //    § 3 owns cadence).
   // ---------------------------------------------------------------------------
-  const deltaMinutes = getEscalationDeltaMinutes(habit.id, currentLevel);
   const nextEscalationAt = now + deltaMinutes * 60 * 1000;
   const newLevel = currentLevel + 1;
 

@@ -320,14 +320,14 @@ describe("runHabitCheckin() at L4", () => {
     expect(row?.next_escalation_at).toBe(NOW_MS + 30 * 60 * 1000);
   });
 
-  it("wind-down L4: throws (no L4→L5 transition), no DB writes", async () => {
+  it("wind-down L4: throws (no L4→L5 transition), no dispatch, no post, no DB writes", async () => {
     seedHabitRun(db, {
       runId: "run-wd-l4",
       habitId: "wind-down",
       currentLevel: 4,
     });
     const { adapter, mockSend } = buildAdapter();
-    const { impl } = happyDispatch();
+    const { impl, calls } = happyDispatch();
     const eventsBefore = countEvents(db);
 
     await expect(
@@ -342,12 +342,12 @@ describe("runHabitCheckin() at L4", () => {
       }),
     ).rejects.toThrowError();
 
-    // post may or may not fire depending on where the throw lands; what
-    // matters is that habit_runs is untouched and no event was appended.
-    // (Current implementation: getEscalationDeltaMinutes is called AFTER
-    // dispatch + post but BEFORE the DB transaction, so mockSend may have
-    // been called once. We assert on the persistent state instead.)
-    void mockSend; // referenced for symmetry with other atomicity tests
+    // Fail-fast contract: getEscalationDeltaMinutes is called immediately
+    // after template selection, BEFORE dispatch and BEFORE the Discord
+    // post. An unsupported (habit, level) combination (wind-down L4) must
+    // throw with no side effects whatsoever.
+    expect(calls.length).toBe(0);
+    expect(mockSend).not.toHaveBeenCalled();
     const row = getRun(db, "run-wd-l4");
     expect(row?.current_level).toBe(4);
     expect(row?.next_escalation_at).toBeNull();
