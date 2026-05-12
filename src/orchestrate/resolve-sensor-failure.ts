@@ -15,18 +15,23 @@
 // holds. better-sqlite3 supports nested transactions via SAVEPOINT, so the
 // inner transaction inside SessionStore.append composes correctly.
 //
+// Connection invariant: the verb operates on `sessionStore.db` directly.
+// SQLite WAL permits one writer at a time; passing a separate Database
+// connection would deadlock on SQLITE_BUSY. To prevent that, the option
+// interface no longer accepts `db` as a separate field — the verb derives
+// it from `sessionStore.db` internally so callers cannot pass a wrong or
+// separate handle.
+//
 // References:
 //   - docs/plans/2026-05-12-phase-a-implementation.md § Task 15
 //   - src/db/migrations/001_habits.sql (habit_runs.status CHECK)
 //   - src/daemon/session-store.ts (append(), L0 trust level rationale)
 
-import type Database from "better-sqlite3";
 import type { SessionStore } from "../daemon/session-store.js";
 
 export type SensorSource = "garmin" | "concept2";
 
 export interface ResolveSensorFailureOptions {
-  readonly db: Database.Database;
   readonly sessionStore: SessionStore;
   readonly sessionId: string;
   readonly runId: string;
@@ -44,7 +49,8 @@ interface SensorFailurePayload {
 }
 
 export function resolveSensorFailure(opts: ResolveSensorFailureOptions): void {
-  const { db, sessionStore, sessionId, runId, source, error } = opts;
+  const { sessionStore, sessionId, runId, source, error } = opts;
+  const db = sessionStore.db;
 
   const payload: SensorFailurePayload = {
     runId,

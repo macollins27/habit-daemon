@@ -165,7 +165,6 @@ describe("resolveSensorFailure()", () => {
 
   it("transitions habit_runs.status to 'unresolved' on garmin failure", () => {
     resolveSensorFailure({
-      db,
       sessionStore,
       sessionId: SESSION_ID,
       runId: RUN_ID,
@@ -180,7 +179,6 @@ describe("resolveSensorFailure()", () => {
 
   it("halts next_escalation_at by setting it to NULL", () => {
     resolveSensorFailure({
-      db,
       sessionStore,
       sessionId: SESSION_ID,
       runId: RUN_ID,
@@ -194,7 +192,6 @@ describe("resolveSensorFailure()", () => {
 
   it("appends a session_events row with event_type='sensor_failure_logged' and trust_level='L0'", () => {
     resolveSensorFailure({
-      db,
       sessionStore,
       sessionId: SESSION_ID,
       runId: RUN_ID,
@@ -214,7 +211,6 @@ describe("resolveSensorFailure()", () => {
   it("payload carries runId, source, and {name,message} of the error", () => {
     const err = new GarminAuthExpired("token expired");
     resolveSensorFailure({
-      db,
       sessionStore,
       sessionId: SESSION_ID,
       runId: RUN_ID,
@@ -233,7 +229,6 @@ describe("resolveSensorFailure()", () => {
 
   it("records source='concept2' when called with a Concept2 failure", () => {
     resolveSensorFailure({
-      db,
       sessionStore,
       sessionId: SESSION_ID,
       runId: RUN_ID,
@@ -254,7 +249,6 @@ describe("resolveSensorFailure()", () => {
 
     expect(() =>
       resolveSensorFailure({
-        db,
         sessionStore,
         sessionId: SESSION_ID,
         runId: "run-does-not-exist",
@@ -275,7 +269,6 @@ describe("resolveSensorFailure()", () => {
 
   it("writes a second event when called twice for the same run; status stays 'unresolved'", () => {
     resolveSensorFailure({
-      db,
       sessionStore,
       sessionId: SESSION_ID,
       runId: RUN_ID,
@@ -284,7 +277,6 @@ describe("resolveSensorFailure()", () => {
     });
 
     resolveSensorFailure({
-      db,
       sessionStore,
       sessionId: SESSION_ID,
       runId: RUN_ID,
@@ -319,7 +311,6 @@ describe("resolveSensorFailure()", () => {
     try {
       expect(() =>
         resolveSensorFailure({
-          db,
           sessionStore,
           sessionId: SESSION_ID,
           runId: RUN_ID,
