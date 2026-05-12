@@ -174,12 +174,12 @@ export function dispatchClaude(opts: DispatchOpts): DispatchResult {
   }
 
   // First arg is the literal program "claude"; /usr/bin/env handles PATH lookup.
-  // NOTE: --bare is intentionally OMITTED. Per claude --help: "--bare ...
-  // Anthropic auth is strictly ANTHROPIC_API_KEY or apiKeyHelper via
-  // --settings (OAuth and keychain are never read)." Founder uses Max plan
-  // OAuth via interactive `claude login`; --bare blocks that auth path.
-  // When founder migrates to ANTHROPIC_API_KEY (e.g., when --bare becomes
-  // default for -p in a future release), add --bare back here.
+  // --bare: opts into strict API-key auth via ANTHROPIC_API_KEY (or apiKeyHelper
+  // via --settings), bypassing the OAuth / keychain fallback. Habit-daemon uses
+  // API-key auth per the deployment contract — the ANTHROPIC_API_KEY env var is
+  // sourced from ~/.habit-daemon/env at startup. Without --bare, the CLI would
+  // attempt to read keychain OAuth tokens from the launchd service user's
+  // session, which isn't reliable for a daemon.
   //
   // --setting-sources "user,project": include both user-level (OAuth keychain)
   // and project-level (.claude/skills/, .claude/settings.json hooks) settings.
@@ -200,6 +200,7 @@ export function dispatchClaude(opts: DispatchOpts): DispatchResult {
   // user,project restores skill resolution while keeping StructuredOutput.
   const args: string[] = [
     "claude",
+    "--bare",
     "--output-format",
     "json",
     "--json-schema",
