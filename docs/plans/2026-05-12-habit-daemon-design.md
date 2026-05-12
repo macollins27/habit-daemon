@@ -110,6 +110,7 @@ habit_runs(
   completed_at INTEGER,
   proof_payload_json TEXT,
   skip_reason TEXT,
+  proof_rejection_callout_due BOOLEAN NOT NULL DEFAULT 0,  -- set when vision rejections reach 3+ in this run; consumed by next habit-checkin prompt builder
   UNIQUE(habit_id, fire_date)
 );
 
