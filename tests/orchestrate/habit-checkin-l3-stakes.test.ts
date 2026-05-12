@@ -564,77 +564,9 @@ describe("runHabitCheckin() at L3 — stakes_well rotation", () => {
     expect(payload.stake).toBe("primary");
   });
 
-  it("L3 pattern_well not yet wired: 3+ same-slug miss_reasons → throws Task 29 message", async () => {
-    seedHabitRun(db, {
-      runId: "run-mr-l3-pattern",
-      habitId: "morning-row",
-      currentLevel: 3,
-    });
-    // Seed three prior habit_runs (the miss_reasons FK references habit_runs)
-    // each on its own past fire_date so the UNIQUE(habit_id, fire_date) holds.
-    const insertRun = db.prepare(
-      `INSERT INTO habit_runs (
-         id, habit_id, fire_date, fired_at, current_level, next_escalation_at,
-         status, completed_at, proof_payload_json, skip_reason,
-         proof_rejection_callout_due
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    );
-    for (let i = 0; i < 3; i += 1) {
-      const priorMs = NOW_MS - (i + 1) * DAY_MS;
-      const priorDate = new Date(priorMs).toISOString().slice(0, 10);
-      insertRun.run(
-        `prior-run-${i}`,
-        "morning-row",
-        priorDate,
-        priorMs,
-        5,
-        null,
-        "missed",
-        null,
-        null,
-        null,
-        0,
-      );
-    }
-    // Seed three miss_reasons in the trailing 28 days with matching slug.
-    const insert = db.prepare(
-      `INSERT INTO miss_reasons (id, habit_id, run_id, miss_date, inferred_specifics, classification, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    );
-    for (let i = 0; i < 3; i += 1) {
-      insert.run(
-        `mr-${i}`,
-        "morning-row",
-        `prior-run-${i}`,
-        FIRE_DATE,
-        "late-gaming-friend:brian",
-        "gaming",
-        NOW_MS - (i + 1) * DAY_MS,
-      );
-    }
-    const { adapter, mockSend } = buildAdapter();
-    const { impl } = happyDispatch();
-    const eventsBefore = countEvents(db);
-
-    await expect(
-      runHabitCheckin({
-        sessionStore,
-        adapter,
-        sessionId: SESSION_ID,
-        runId: "run-mr-l3-pattern",
-        currentLevel: 3,
-        now: NOW_MS,
-        dispatchImpl: impl,
-      }),
-    ).rejects.toThrowError(/Task 29/);
-
-    // No DB writes: the template selection throws BEFORE dispatch/post.
-    expect(mockSend).not.toHaveBeenCalled();
-    expect(countEvents(db)).toBe(eventsBefore);
-    const row = getRun(db, "run-mr-l3-pattern");
-    expect(row?.current_level).toBe(3);
-    expect(row?.next_escalation_at).toBeNull();
-  });
+  // Task 29 removed the "pattern throws" test from this file; the
+  // pattern_well branch now dispatches successfully and is exercised end to
+  // end in tests/orchestrate/habit-checkin-l3-pattern.test.ts.
 
   it("wind-down L3: next_escalation_at = now + 2 min", async () => {
     seedHabitRun(db, {

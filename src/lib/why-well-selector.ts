@@ -23,6 +23,7 @@ import {
   detectPriorNightAnomaly,
   detectTrailingWeekAnomaly,
 } from "./anomaly-detector.js";
+import { detectPattern } from "./pattern-detector.js";
 
 // ------------------------------------------------------------------------
 // Public types
@@ -102,7 +103,7 @@ export type WellSelection = PatternPayload | BodyDataPayload | StakesPayload;
 // ------------------------------------------------------------------------
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const PATTERN_LOOKBACK_MS = 28 * DAY_MS;
+const PATTERN_LOOKBACK_DAYS = 28;
 const PATTERN_COOLDOWN_MS = 14 * DAY_MS;
 const PATTERN_THRESHOLD = 3;
 
@@ -150,25 +151,12 @@ function readStringArray(
 
 // ------------------------------------------------------------------------
 // Pattern branch
+//
+// The grouping + threshold logic lives in src/lib/pattern-detector.ts (Task
+// 29). The selector handles habit-level routing — checking the 14-day
+// cooldown, calling the detector, and packaging the result into a
+// `PatternPayload` with the habit's framing template.
 // ------------------------------------------------------------------------
-
-function groupBySlugPrefix(
-  missReasons: readonly MissReason[],
-): Map<string, MissReason[]> {
-  const groups = new Map<string, MissReason[]>();
-  for (const mr of missReasons) {
-    if (!mr.inferred_specifics) continue;
-    const prefix = mr.inferred_specifics.split(":")[0];
-    if (!prefix) continue;
-    const existing = groups.get(prefix);
-    if (existing) {
-      existing.push(mr);
-    } else {
-      groups.set(prefix, [mr]);
-    }
-  }
-  return groups;
-}
 
 function tryPattern(ctx: WellSelectionContext): PatternPayload | null {
   // Cooldown gate first — cheap.
@@ -179,37 +167,22 @@ function tryPattern(ctx: WellSelectionContext): PatternPayload | null {
     return null;
   }
 
-  const inWindow = ctx.missReasons30d.filter(
-    (mr) => mr.created_at >= ctx.now - PATTERN_LOOKBACK_MS,
-  );
-  const groups = groupBySlugPrefix(inWindow);
+  const result = detectPattern(ctx.missReasons30d, ctx.now, {
+    lookbackDays: PATTERN_LOOKBACK_DAYS,
+    threshold: PATTERN_THRESHOLD,
+  });
 
-  // Pick the largest group ≥ threshold.
-  let bestPrefix: string | null = null;
-  let bestGroup: MissReason[] | null = null;
-  for (const [prefix, group] of groups) {
-    if (group.length < PATTERN_THRESHOLD) continue;
-    if (bestGroup === null || group.length > bestGroup.length) {
-      bestPrefix = prefix;
-      bestGroup = group;
-    }
-  }
-
-  if (bestPrefix === null || bestGroup === null) return null;
+  if (!result.thresholdMet || result.winner === null) return null;
 
   const patternWell = readObject(ctx.habit.why_stakes, "pattern_well");
   const framingTemplate =
     (patternWell && readString(patternWell, "framing_template")) ?? "";
 
-  // Exemplar = first inferred_specifics in the group (chronologically first
-  // in the source order; the verb passes rows in created_at order).
-  const exemplar = bestGroup[0]?.inferred_specifics ?? bestPrefix;
-
   return {
     well: "pattern",
-    slugPrefix: bestPrefix,
-    count: bestGroup.length,
-    exemplarSpecifics: exemplar,
+    slugPrefix: result.winner.slugPrefix,
+    count: result.winner.count,
+    exemplarSpecifics: result.winner.exemplarSpecifics,
     framingTemplate,
   };
 }

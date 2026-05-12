@@ -53,6 +53,7 @@ import { LEVEL_1_TEMPLATE } from "../lib/prompt-templates/level-1.js";
 import { LEVEL_2_TEMPLATE } from "../lib/prompt-templates/level-2.js";
 import { buildL3StakesTemplate } from "../lib/prompt-templates/level-3-stakes.js";
 import { buildL3BodyDataTemplate } from "../lib/prompt-templates/level-3-body-data.js";
+import { buildL3PatternTemplate } from "../lib/prompt-templates/level-3-pattern.js";
 import {
   selectWell,
   type MissReason,
@@ -246,9 +247,7 @@ function selectLevelTemplate(
         case "body_data":
           return buildL3BodyDataTemplate(opts.wellSelection);
         case "pattern":
-          throw new Error(
-            "habit-checkin L3 pattern template not yet wired (Task 29)",
-          );
+          return buildL3PatternTemplate(opts.wellSelection);
       }
       // Exhaustive switch — TypeScript should never let us get here.
       throw new Error(
@@ -626,11 +625,13 @@ export async function runHabitCheckin(
       ).run(runId);
     }
 
-    // The L3 dispatch carries `well` (+ `stake` when stakes is chosen) so the
-    // next L3 invocation can find this usage via json_extract and rotate /
-    // dedup. L1/L2 omit these fields entirely — aat-chain.jsonCanonicalize
-    // rejects `undefined` keys, so we use a conditional spread (the same
-    // pattern Task 19's vision-rejection-counter uses).
+    // The L3 dispatch carries `well` (+ `stake` when stakes is chosen, +
+    // `anomalousSignals` for body_data, + `slugPrefix`/`patternCount` for
+    // pattern) so the next L3 invocation can find this usage via
+    // json_extract and rotate / dedup. L1/L2 omit these fields entirely —
+    // aat-chain.jsonCanonicalize rejects `undefined` keys, so we use a
+    // conditional spread (the same pattern Task 19's
+    // vision-rejection-counter uses).
     const eventPayload: Record<string, unknown> = {
       habitId: habit.id,
       runId,
@@ -643,6 +644,12 @@ export async function runHabitCheckin(
         : {}),
       ...(wellSelection !== undefined && wellSelection.well === "body_data"
         ? { anomalousSignals: wellSelection.anomalousSignals }
+        : {}),
+      ...(wellSelection !== undefined && wellSelection.well === "pattern"
+        ? {
+            slugPrefix: wellSelection.slugPrefix,
+            patternCount: wellSelection.count,
+          }
         : {}),
     };
 
