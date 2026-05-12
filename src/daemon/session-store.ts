@@ -1,7 +1,3 @@
-/**
- * Forked from Property-Linkware-v2.1/scripts/lib/orchestrator/session-store.ts
- * at PLW commit v1 (26c8c049). Diverges from this point. Do not auto-sync.
- */
 // scripts/lib/orchestrator/session-store.ts
 //
 // SQLite-backed implementation of Anthropic's SessionStore interface.
@@ -10,8 +6,6 @@
 //
 // References:
 //   - https://code.claude.com/docs/en/agent-sdk/sessions
-//   - docs/plans/master-orchestrator-design-v2.md §2.3 (schema rationale)
-//   - docs/plans/master-orchestrator-design-v2.md §5 (SessionStore as canonical primitive)
 
 import Database from "better-sqlite3";
 import { buildRecord, type AatRecord, type TrustLevel } from "./aat-chain.js";
@@ -43,7 +37,7 @@ export class SessionStore {
   readonly db: Database.Database;
 
   constructor(opts: SessionStoreOptions) {
-    // The caller (bin/plw via env.sh, or test setup) MUST ensure the parent
+    // The caller (bin/dispatch via env.sh, or test setup) MUST ensure the parent
     // directory exists before constructing SessionStore. We do not mkdir here:
     // security/detect-non-literal-fs-filename would flag a non-literal path,
     // and lint suppressions are not allowed in non-allowlisted scripts.

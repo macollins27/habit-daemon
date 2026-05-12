@@ -1,14 +1,3 @@
-/**
- * Forked from Property-Linkware-v2.1/scripts/lib/orchestrator/cron-parser.ts
- * at PLW commit v1 (26c8c049). Diverges from this point. Do not auto-sync.
- *
- * Habit-daemon divergence: matches against LOCAL time, not UTC. PLW's parser
- * uses getUTCMinutes/getUTCHours/getUTCDate/getUTCMonth/getUTCDay and a
- * tz="UTC" fallback. Single-host single-timezone deployment in
- * America/New_York means cron strings like `5 9 * * *` are interpreted as
- * 9:05am local. Replaced getUTC* with get* and removed tz="UTC" from the
- * cron-parser package fallback. See docs/retros/phase-A-divergences.md #3.
- */
 // scripts/lib/orchestrator/cron-parser.ts
 //
 // Hand-rolled minimal 5-field cron parser. Supports:
@@ -22,12 +11,11 @@
 //   - Day-of-week names ("MON,TUE")
 //   - Last-day-of-month ("L"), nth-weekday ("#")
 //
-// Sufficient for plw v0.3 scaffolding's common deployment cases (every-N-min,
+// Sufficient for v0.3 scaffolding's common deployment cases (every-N-min,
 // hourly, daily-at-time, weekly-on-day). Founder can swap to the cron-parser
 // npm package if they need full grammar later.
 //
 // References:
-//   - docs/plans/master-orchestrator-design-v2.md §15 (v0.3 phased build)
 //   - https://en.wikipedia.org/wiki/Cron#Cron_expression
 
 export interface CronExpr {

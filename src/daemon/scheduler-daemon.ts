@@ -1,15 +1,3 @@
-/**
- * Forked from Property-Linkware-v2.1/scripts/orchestrate/scheduler-daemon.ts
- * at PLW commit v1 (26c8c049). Diverges from this point. Do not auto-sync.
- *
- * Habit-daemon adaptation (Task 4, 2026-05-12; divergence #2): the
- * `bin/plw` subprocess spawn that used to live inside scheduler.ts now lives
- * here, inside the dispatch factory passed to schedulerTick. The scheduler
- * itself is substrate-agnostic. The `bin/plw` spawn is retained for Phase A
- * bootstrap so the daemon entry-point keeps working end-to-end; it will be
- * replaced by an in-process verb dispatch map at Task 32. PLW_* env vars
- * stay as-is and are renamed to HABIT_* at Task 39 per divergence #2.
- */
 // scripts/orchestrate/scheduler-daemon.ts
 //
 // Long-running scheduler entry point. Run via systemd (canonical) or
@@ -18,15 +6,14 @@
 // heartbeat file every iteration.
 //
 // Environment:
-//   PLW_LEDGER_DB             ledger path
-//   PROJECT_ROOT              repo root (for bin/plw resolution)
+//   HABIT_LEDGER_DB             ledger path
+//   PROJECT_ROOT              repo root (for bin/dispatch resolution)
 //   NOTIFY_SOCKET             systemd Type=notify watchdog socket (set by systemd)
-//   PLW_HEARTBEAT_FILE        heartbeat-file path (default $PLW_STATE_DIR/plw.heartbeat)
-//   PLW_TICK_INTERVAL_SEC     polling interval (default 30; min 10)
-//   PLW_WAL_CHECKPOINT_SEC    interval between WAL checkpoint pragma (default 600)
+//   HABIT_HEARTBEAT_FILE        heartbeat-file path (default $HABIT_STATE_DIR/habit-daemon.heartbeat)
+//   HABIT_TICK_INTERVAL_SEC     polling interval (default 30; min 10)
+//   HABIT_WAL_CHECKPOINT_SEC    interval between WAL checkpoint pragma (default 600)
 //
 // References:
-//   - docs/plans/master-orchestrator-design-v2.md §15 (v0.3)
 //   - docs/orchestrator/deploy.md (operational guide)
 
 import { spawnSync } from "node:child_process";
@@ -39,16 +26,16 @@ import {
 } from "./heartbeat.js";
 
 function info(line: string): void {
-  process.stdout.write(`[plw-daemon] ${line}\n`);
+  process.stdout.write(`[habit-daemon] ${line}\n`);
 }
 function err(line: string): void {
-  process.stderr.write(`[plw-daemon] ${line}\n`);
+  process.stderr.write(`[habit-daemon] ${line}\n`);
 }
 
 function resolveDbPath(): string {
-  if (process.env.PLW_LEDGER_DB) return process.env.PLW_LEDGER_DB;
+  if (process.env.HABIT_LEDGER_DB) return process.env.HABIT_LEDGER_DB;
   const stateDir =
-    process.env.PLW_STATE_DIR ??
+    process.env.HABIT_STATE_DIR ??
     resolve(process.env.PROJECT_ROOT ?? process.cwd(), ".claude/state");
   return resolve(stateDir, "orchestrator-ledger.db");
 }
@@ -75,8 +62,8 @@ function clampInterval(envValue: string | undefined, defaultSec: number, minSec:
   return n;
 }
 
-function defaultPlwBin(): string {
-  return resolve(process.env.PROJECT_ROOT ?? process.cwd(), "bin/plw");
+function defaultDispatchBin(): string {
+  return resolve(process.env.PROJECT_ROOT ?? process.cwd(), "bin/dispatch");
 }
 
 function parseArgsJson(argsJson: string): readonly string[] {
@@ -89,23 +76,22 @@ function parseArgsJson(argsJson: string): readonly string[] {
 }
 
 /**
- * Phase A dispatch factory. Spawns `bin/plw <verb> <args...>` via /usr/bin/env
+ * Phase A dispatch factory. Spawns `bin/dispatch <verb> <args...>` via /usr/bin/env
  * and throws on non-zero exit so schedulerTick can route the failure through
- * its missed_run_policy branch. To be replaced at Task 32 by an in-process
- * verb dispatch map (divergence #2 — PLW fork adaptation at point of
- * activation).
+ * its missed_run_policy branch. To be replaced by an in-process verb dispatch
+ * map in a later phase.
  */
-function makeBinPlwDispatch(plwBin: string): DispatchFn {
+function makeSubprocessDispatch(dispatchBin: string): DispatchFn {
   return async (verb: string, argsJson: string): Promise<void> => {
     const args = parseArgsJson(argsJson);
-    const result = spawnSync("/usr/bin/env", [plwBin, verb, ...args], {
+    const result = spawnSync("/usr/bin/env", [dispatchBin, verb, ...args], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
     const exitCode = result.status ?? -1;
     if (exitCode !== 0) {
       const stderrTail = (result.stderr ?? "").slice(0, 500);
-      throw new Error(`bin/plw ${verb} exited ${String(exitCode)}: ${stderrTail}`);
+      throw new Error(`bin/dispatch ${verb} exited ${String(exitCode)}: ${stderrTail}`);
     }
   };
 }
@@ -170,20 +156,20 @@ export function createLoop(ctx: LoopContext): () => Promise<void> {
 }
 
 function main(): void {
-  const tickIntervalSec = clampInterval(process.env.PLW_TICK_INTERVAL_SEC, 30, 10);
-  const walCheckpointSec = clampInterval(process.env.PLW_WAL_CHECKPOINT_SEC, 600, 60);
+  const tickIntervalSec = clampInterval(process.env.HABIT_TICK_INTERVAL_SEC, 30, 10);
+  const walCheckpointSec = clampInterval(process.env.HABIT_WAL_CHECKPOINT_SEC, 600, 60);
 
   const dbPath = resolveDbPath();
   const heartbeatPath = resolveHeartbeatPath();
-  const plwBin = defaultPlwBin();
+  const dispatchBin = defaultDispatchBin();
 
   info(`starting (tick=${String(tickIntervalSec)}s, wal-checkpoint=${String(walCheckpointSec)}s)`);
   info(`ledger:    ${dbPath}`);
   info(`heartbeat: ${heartbeatPath}`);
-  info(`bin/plw:   ${plwBin}`);
+  info(`bin/dispatch:   ${dispatchBin}`);
 
   const ledger = new Ledger({ dbPath });
-  const dispatch = makeBinPlwDispatch(plwBin);
+  const dispatch = makeSubprocessDispatch(dispatchBin);
 
   // sd_notify READY=1 (systemd Type=notify required signal)
   sdNotifyViaCli("READY=1");

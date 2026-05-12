@@ -1,21 +1,8 @@
-/**
- * Forked from Property-Linkware-v2.1/scripts/lib/orchestrator/scheduler.ts
- * at PLW commit v1 (26c8c049). Diverges from this point. Do not auto-sync.
- *
- * Habit-daemon adaptation (Task 4, 2026-05-12; divergence #2 — PLW fork
- * adaptation at point of activation): the scheduler is now substrate-agnostic.
- * Instead of owning a `Ledger` and a `bin/plw` subprocess spawner, it operates
- * on a raw better-sqlite3 `Database` and delegates verb execution to a
- * caller-supplied `dispatch` callback. This lets the daemon (which still
- * spawns `bin/plw` during Phase A bootstrap) and tests (which inject a no-op
- * dispatch) share one codepath. PLW's missed_run_policy semantics
- * (skip/catchup/fail) and the cron → next_run_iso flow are preserved verbatim.
- */
 // scripts/lib/orchestrator/scheduler.ts
 //
 // Long-running scheduler loop. Reads schedules table, computes next run time
 // per row via cron-parser.ts, sleeps until the next due time, dispatches the
-// matching plw verb via spawn, updates last_run_iso + next_run_iso, repeats.
+// matching verb via spawn, updates last_run_iso + next_run_iso, repeats.
 //
 // missed_run_policy (per R7 Autobeat lift):
 //   - "skip"    — if the scheduler missed runs while sleeping (e.g., daemon
@@ -24,7 +11,6 @@
 //   - "fail"    — log a missed-run error finding and pause the schedule
 //
 // References:
-//   - docs/plans/master-orchestrator-design-v2.md §15 (v0.3 phased build)
 //   - R7 finding: 2026-05-02_agentmanager-autobeat-deep-dive.md (missed_run_policy)
 
 import type Database from "better-sqlite3";
@@ -45,7 +31,7 @@ export interface ScheduleRow {
 
 /**
  * Caller-supplied verb dispatcher. Rejecting or throwing is treated as a
- * dispatch failure (analogous to a non-zero exit code in the PLW
+ * dispatch failure (analogous to a non-zero exit code in the subprocess
  * spawn-based implementation).
  */
 export type DispatchFn = (verb: string, argsJson: string) => Promise<void> | void;

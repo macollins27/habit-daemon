@@ -1,7 +1,3 @@
-/**
- * Forked from Property-Linkware-v2.1/scripts/lib/orchestrator/kill-switch.ts
- * at PLW commit v1 (26c8c049). Diverges from this point. Do not auto-sync.
- */
 // scripts/lib/orchestrator/kill-switch.ts
 //
 // AgentManager-pattern kill switch (R7 lift, GCS→SQLite substrate swap).
@@ -9,11 +5,10 @@
 // loops poll isKillRequested between dispatches.
 //
 // v0.1 ships the read/write primitive. v0.2+ wires the poll into the
-// remediate dispatch loop so a `plw kill <run-id>` from another terminal
+// remediate dispatch loop so a a kill command from another terminal
 // stops the in-flight dispatch at the next checkpoint.
 //
 // References:
-//   - docs/plans/master-orchestrator-design-v2.md §3 (kill verb)
 //   - R7 finding: 2026-05-02_agentmanager-autobeat-deep-dive.md (kill-switch lift)
 
 import { Ledger } from "./ledger.js";

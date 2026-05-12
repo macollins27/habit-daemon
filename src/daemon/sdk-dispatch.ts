@@ -1,39 +1,32 @@
-/**
- * Forked from Property-Linkware-v2.1/scripts/lib/orchestrator/sdk-dispatch.ts
- * at PLW commit v1 (26c8c049). Diverges from this point. Do not auto-sync.
- */
 // scripts/lib/orchestrator/sdk-dispatch.ts
 //
-// Spawn a single `claude -p` subprocess with the canonical plw flag set
+// Spawn a single `claude -p` subprocess with the canonical flag set
 // (--bare, --output-format json, --json-schema, --model, --max-turns,
 // --max-budget-usd, --allowedTools, optionally --mcp-config, optionally
 // --append-system-prompt-file).
 //
-// PLW_DRY_RUN=1 short-circuits actual subprocess invocation and returns a
+// HABIT_DRY_RUN=1 short-circuits actual subprocess invocation and returns a
 // stub success envelope so the surrounding pipeline (footer parser, ledger
 // write, hash chain append) can be validated end-to-end without consuming
 // Max-plan tokens.
 //
 // Lint discipline: spawnSync uses `/usr/bin/env claude` as the literal first
 // argument so security/detect-child-process accepts it. CLAUDE_BIN is checked
-// up-front by bin/plw via env.sh (plw_check_claude_bin); the TS layer relies
+// up-front by bin/dispatch via env.sh (check_claude_bin); the TS layer relies
 // on `claude` being on PATH at this point.
 //
 // Future v0.2: swap raw spawnSync for @anthropic-ai/claude-agent-sdk
 // query() to gain session-resume, fork, and live stream-json events.
 //
 // References:
-//   - docs/plans/master-orchestrator-design-v2.md §2.1 (substrate decision)
-//   - docs/plans/master-orchestrator-design-v2.md §4 (dispatch flag shape)
-//   - docs/plans/master-orchestrator-design-v2.md §6 (model routing)
 
 import { spawnSync } from "node:child_process";
 import { query as anthropicQuery, AbortError } from "@anthropic-ai/claude-agent-sdk";
 
-export type PlwModel = "claude-opus-4-7" | "claude-sonnet-4-6" | "claude-haiku-4-5-20251001";
+export type DispatchModel = "claude-opus-4-7" | "claude-sonnet-4-6" | "claude-haiku-4-5-20251001";
 
 export interface DispatchOpts {
-  readonly model: PlwModel;
+  readonly model: DispatchModel;
   readonly prompt: string;
   /** JSON-stringified JSON Schema; usually footerSchemaJson() */
   readonly jsonSchema: string;
@@ -81,7 +74,7 @@ function buildDryRunStub(opts: DispatchOpts): DispatchResult {
       scope_risk: "narrow",
       reversibility: "clean",
     },
-    plw_dry_run_dispatch_args: {
+    dry_run_dispatch_args: {
       model: opts.model,
       max_turns: opts.maxTurns,
       max_budget_usd: opts.maxBudgetUsd,
@@ -102,7 +95,7 @@ function buildDryRunStub(opts: DispatchOpts): DispatchResult {
 }
 
 /**
- * v0.2 SDK substrate stub. When PLW_USE_SDK=1 in the environment, dispatches
+ * v0.2 SDK substrate stub. When HABIT_USE_SDK=1 in the environment, dispatches
  * route through @anthropic-ai/claude-agent-sdk's `query()` instead of raw
  * spawnSync. Unlocks session-resume / fork / file-checkpointing per design
  * v2 §2.1. The stub currently delegates to dispatchClaude (raw spawn) until
@@ -121,14 +114,14 @@ export async function dispatchClaudeViaSdk(opts: DispatchOpts): Promise<Dispatch
 function buildSandboxDispatchEnv(opts: DispatchOpts): NodeJS.ProcessEnv {
   return {
     ...process.env,
-    PLW_DISPATCH_PROMPT: opts.prompt,
-    PLW_DISPATCH_JSON_SCHEMA: opts.jsonSchema,
-    PLW_DISPATCH_MODEL: opts.model,
-    PLW_DISPATCH_MAX_TURNS: String(opts.maxTurns),
-    PLW_DISPATCH_MAX_BUDGET: String(opts.maxBudgetUsd),
-    PLW_DISPATCH_ALLOWED_TOOLS: opts.allowedTools.join(","),
-    PLW_DISPATCH_ID: `plw-${Date.now().toString(36)}`,
-    ...(opts.mcpConfigPath !== undefined ? { PLW_DISPATCH_MCP_CONFIG: opts.mcpConfigPath } : {}),
+    HABIT_DISPATCH_PROMPT: opts.prompt,
+    HABIT_DISPATCH_JSON_SCHEMA: opts.jsonSchema,
+    HABIT_DISPATCH_MODEL: opts.model,
+    HABIT_DISPATCH_MAX_TURNS: String(opts.maxTurns),
+    HABIT_DISPATCH_MAX_BUDGET: String(opts.maxBudgetUsd),
+    HABIT_DISPATCH_ALLOWED_TOOLS: opts.allowedTools.join(","),
+    HABIT_DISPATCH_ID: `habit-${Date.now().toString(36)}`,
+    ...(opts.mcpConfigPath !== undefined ? { HABIT_DISPATCH_MCP_CONFIG: opts.mcpConfigPath } : {}),
   };
 }
 
@@ -175,10 +168,10 @@ function dispatchClaudeViaSandbox(opts: DispatchOpts): DispatchResult {
 }
 
 export function dispatchClaude(opts: DispatchOpts): DispatchResult {
-  if (process.env.PLW_DRY_RUN === "1") {
+  if (process.env.HABIT_DRY_RUN === "1") {
     return buildDryRunStub(opts);
   }
-  if (process.env.PLW_USE_SANDBOX === "1") {
+  if (process.env.HABIT_USE_SANDBOX === "1") {
     return dispatchClaudeViaSandbox(opts);
   }
 
@@ -203,7 +196,7 @@ export function dispatchClaude(opts: DispatchOpts): DispatchResult {
   // strip). With $schema stripped, StructuredOutput injects correctly under
   // all --setting-sources values (verified across user / user,project /
   // project / "" combinations). Excluding project skills meant the Skill tool
-  // returned "Unknown skill: <name>" for every plw skill — verified via L2
+  // returned "Unknown skill: <name>" for every skill — verified via L2
   // dispatch session 417409d4 tool_result trace. The model improvised work
   // without the skill protocol's mechanical checks (15-grep audit, etc.).
   // user,project restores skill resolution while keeping StructuredOutput.

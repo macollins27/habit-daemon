@@ -1,11 +1,7 @@
-/**
- * Forked from Property-Linkware-v2.1/scripts/lib/orchestrator/verify-footer.ts
- * at PLW commit v1 (26c8c049). Diverges from this point. Do not auto-sync.
- */
 // scripts/lib/orchestrator/verify-footer.ts
 //
 // Parse the JSON envelope returned by `claude -p --output-format json` and
-// validate the structured_output payload against PlwFooterSchema. Run cross-
+// validate the structured_output payload against FooterSchema. Run cross-
 // field validation that JSON Schema cannot natively express. Verify write_set
 // scope (every path inside dispatch.authorized_paths) + path existence on disk.
 //
@@ -17,11 +13,9 @@
 // paths). spawnSync uses literal first arg.
 //
 // References:
-//   - docs/plans/master-orchestrator-design-v2.md §4 (verification flow steps 1-9)
-//   - docs/plans/master-orchestrator-design-v2.md §7 (anti-fabrication mechanisms)
 
 import { spawnSync } from "node:child_process";
-import { PlwFooterSchema, validateFooterCrossFields, type PlwFooter } from "./footer-schema.js";
+import { FooterSchema, validateFooterCrossFields, type Footer } from "./footer-schema.js";
 
 export interface ClaudeJsonEnvelope {
   readonly type: string;
@@ -35,7 +29,7 @@ export interface ClaudeJsonEnvelope {
   readonly structured_output?: unknown;
 }
 
-export type VerifyVerdict = { ok: true; footer: PlwFooter } | { ok: false; error: string };
+export type VerifyVerdict = { ok: true; footer: Footer } | { ok: false; error: string };
 
 export interface VerifySubargs {
   readonly authorizedPaths: readonly string[];
@@ -130,7 +124,7 @@ export function verifyFooter(envelope: ClaudeJsonEnvelope, subargs: VerifySubarg
     return { ok: false, error: "envelope.structured_output missing (footer not enforced?)" };
   }
 
-  const parsed = PlwFooterSchema.safeParse(envelope.structured_output);
+  const parsed = FooterSchema.safeParse(envelope.structured_output);
   if (!parsed.success) {
     const issues = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
     return { ok: false, error: `footer schema validation failed: ${issues}` };

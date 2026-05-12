@@ -1,16 +1,9 @@
-/**
- * Forked from Property-Linkware-v2.1/scripts/lib/orchestrator/ledger.ts
- * at PLW commit v1 (26c8c049). Diverges from this point. Do not auto-sync.
- */
 // scripts/lib/orchestrator/ledger.ts
 //
-// plw orchestrator state on top of SessionStore.
+// orchestrator state on top of SessionStore.
 // Tables: runs, dispatches, actions, cursors, findings, schedules.
 //
 // References:
-//   - docs/plans/master-orchestrator-design-v2.md §2.3 (schema)
-//   - docs/plans/master-orchestrator-design-v2.md §6 (cost discipline)
-//   - docs/plans/master-orchestrator-design-v2.md §7 (anti-fabrication mechanisms)
 
 import { SessionStore } from "./session-store.js";
 
@@ -90,7 +83,7 @@ export interface LedgerOptions {
 export class Ledger {
   readonly sessionStore: SessionStore;
   // db is the underlying Database handle from sessionStore. We intentionally
-  // share so plw's tables and Anthropic's session_events live in the same file
+  // share so the daemon's tables and Anthropic's session_events live in the same file
   // with the same WAL + foreign-key enforcement.
   private get db() {
     return this.sessionStore.db;
@@ -234,7 +227,7 @@ export class Ledger {
   /**
    * Add to the run's accumulated cost. Called by remediate.ts after each
    * dispatch with the dispatch's envelope total_cost_usd. Surfaced in
-   * `plw status` so the founder sees per-run cost (not just per-day).
+   * the status command so the founder sees per-run cost (not just per-day).
    */
   addRunCost(runId: string, amount: number): void {
     if (!Number.isFinite(amount) || amount <= 0) return;
@@ -321,8 +314,8 @@ export class Ledger {
   }
 
   /**
-   * Insert a new finding row. Used by `plw qa` to bridge qa-runner's
-   * SUMMARY.json into the orchestrator's findings table for `plw status`
+   * Insert a new finding row. Used by the qa command to bridge qa-runner's
+   * SUMMARY.json into the orchestrator's findings table for the status command
    * surfacing.
    */
   writeFinding(args: {

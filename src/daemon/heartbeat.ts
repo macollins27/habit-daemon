@@ -1,7 +1,3 @@
-/**
- * Forked from Property-Linkware-v2.1/scripts/lib/orchestrator/heartbeat.ts
- * at PLW commit v1 (26c8c049). Diverges from this point. Do not auto-sync.
- */
 // scripts/lib/orchestrator/heartbeat.ts
 //
 // Heartbeat write + staleness-check primitives per design v2 §13 + R7.
@@ -9,7 +5,7 @@
 // Three-layer liveness shape:
 //   Layer 1: process check (systemd / launchd handles externally)
 //   Layer 2: heartbeat file mtime — written by long-lived daemons (scheduler)
-//            on each tick; checked by `plw status` + monitoring scripts.
+//            on each tick; checked by the status command + monitoring scripts.
 //   Layer 3: cron-driven staleness check (infrastructure/orchestrator/heartbeat.sh
 //            check, scheduled via crontab-example or systemd timer).
 //
@@ -19,7 +15,6 @@
 //
 // References:
 //   - infrastructure/orchestrator/heartbeat.sh (bash sibling)
-//   - docs/plans/master-orchestrator-design-v2.md §13 (resilience)
 
 import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
@@ -27,11 +22,11 @@ import { resolve } from "node:path";
 const DEFAULT_STALENESS_SEC = 1800; // 30 minutes — matches heartbeat.sh default
 
 export function resolveHeartbeatPath(): string {
-  if (process.env.PLW_HEARTBEAT_FILE) return process.env.PLW_HEARTBEAT_FILE;
+  if (process.env.HABIT_HEARTBEAT_FILE) return process.env.HABIT_HEARTBEAT_FILE;
   const stateDir =
-    process.env.PLW_STATE_DIR ??
+    process.env.HABIT_STATE_DIR ??
     resolve(process.env.PROJECT_ROOT ?? process.cwd(), ".claude/state");
-  return resolve(stateDir, "plw.heartbeat");
+  return resolve(stateDir, "habit-daemon.heartbeat");
 }
 
 /**
@@ -59,7 +54,7 @@ export interface HeartbeatStatus {
 
 /**
  * Read the heartbeat file mtime + content; report freshness vs threshold.
- * Used by `plw status` to surface "is the daemon alive?" without depending
+ * Used by the status command to surface "is the daemon alive?" without depending
  * on systemd/launchd.
  */
 export function checkHeartbeat(opts?: { path?: string; stalenessSec?: number }): HeartbeatStatus {

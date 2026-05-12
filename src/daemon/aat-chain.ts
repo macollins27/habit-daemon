@@ -1,7 +1,3 @@
-/**
- * Forked from Property-Linkware-v2.1/scripts/lib/orchestrator/aat-chain.ts
- * at PLW commit v1 (26c8c049). Diverges from this point. Do not auto-sync.
- */
 // scripts/lib/orchestrator/aat-chain.ts
 //
 // IETF draft-sharif-agent-audit-trail-style hash-chain primitives.
@@ -18,12 +14,11 @@
 //   L3 — claim + cryptographic signature
 //   L4 — claim + signature + third-party attestation
 //
-// plw v0.1 emits L1 + L2 records; L3+ deferred to a future phase.
+// v0.1 emits L1 + L2 records; L3+ deferred to a future phase.
 //
 // References:
 //   - https://datatracker.ietf.org/doc/draft-sharif-agent-audit-trail/
 //   - https://datatracker.ietf.org/doc/html/rfc8785
-//   - docs/plans/master-orchestrator-design-v2.md §7 (anti-fabrication mechanisms)
 
 import { createHash } from "node:crypto";
 
@@ -49,7 +44,7 @@ export interface AatRecordInput {
  * Canonicalize a value per RFC 8785 (JCS). Sorts object keys lexicographically;
  * arrays preserve order; numbers in IEEE 754 double; strings UTF-8.
  *
- * Note: this is a minimal implementation sufficient for plw's event payloads
+ * Note: this is a minimal implementation sufficient for the daemon's event payloads
  * (no NaN/Infinity, no BigInt, no circular references). The official `canonicalize`
  * npm package would be the production-grade choice; we hand-roll here to keep
  * the v0.1 dependency surface flat.

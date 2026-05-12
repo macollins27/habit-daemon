@@ -5,7 +5,7 @@ import { schedulerTick } from "../../src/daemon/scheduler.js";
 describe("scheduler tick", () => {
   it("runs against empty schedules table without error", async () => {
     const db = new Database(":memory:");
-    // schedules table shape == PLW's (from src/daemon/ledger.ts
+    // schedules table shape matches the daemon's ledger (from src/daemon/ledger.ts
     // applyLedgerSchema) + dispatch_priority column added by migration 003.
     // Reconciled with production reality 2026-05-12: see commit history.
     db.exec(`CREATE TABLE schedules (

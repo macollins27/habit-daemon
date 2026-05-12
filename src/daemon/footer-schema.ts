@@ -1,23 +1,17 @@
-/**
- * Forked from Property-Linkware-v2.1/scripts/lib/orchestrator/footer-schema.ts
- * at PLW commit v1 (26c8c049). Diverges from this point. Do not auto-sync.
- */
 // scripts/lib/orchestrator/footer-schema.ts
 //
-// Zod schema for the structured output every dispatched plw subagent emits.
+// Zod schema for the structured output every dispatched subagent emits.
 // Passed to `claude -p --json-schema "<schema>"` so the runtime constrains
 // generation token-by-token (per Anthropic's structured-outputs constrained
 // decoding). The orchestrator then parses the JSON envelope's
 // .structured_output field against this same Zod schema.
 //
 // References:
-//   - docs/plans/master-orchestrator-design-v2.md §4 (structured output schema)
-//   - docs/plans/master-orchestrator-design-v2.md §7 (anti-fabrication mechanisms)
 //   - https://code.claude.com/docs/en/agent-sdk/structured-outputs
 
 import { z } from "zod";
 
-export const PlwFooterSchema = z
+export const FooterSchema = z
   .object({
     artifact_path: z
       .string()
@@ -43,7 +37,7 @@ export const PlwFooterSchema = z
       .optional()
       .describe(
         "Required when write_set is non-empty: one-line description of the root cause that " +
-          "motivated the changes. Plw rejects empty root_cause when write_set has entries.",
+          "motivated the changes. The schema rejects empty root_cause when write_set has entries.",
       ),
     evidence: z
       .string()
@@ -51,7 +45,7 @@ export const PlwFooterSchema = z
       .optional()
       .describe(
         "Required when write_set is non-empty: one-line citation of file:line that supports " +
-          "root_cause. Plw rejects empty evidence when write_set has entries.",
+          "root_cause. The schema rejects empty evidence when write_set has entries.",
       ),
     confidence: z.enum(["low", "medium", "high"]).describe("Self-graded confidence in the work."),
     scope_risk: z
@@ -69,9 +63,9 @@ export const PlwFooterSchema = z
       .optional()
       .describe("Known gaps in test coverage with reasons. Empty if no known gaps."),
   })
-  .describe("plw structured-output footer v1");
+  .describe("structured-output footer v1");
 
-export type PlwFooter = z.infer<typeof PlwFooterSchema>;
+export type Footer = z.infer<typeof FooterSchema>;
 
 export interface CrossFieldOk {
   readonly ok: true;
@@ -87,7 +81,7 @@ export type CrossFieldResult = CrossFieldOk | CrossFieldFailure;
  * root_cause + evidence are REQUIRED when write_set is non-empty.
  * Per design v2 §4 step 6.
  */
-export function validateFooterCrossFields(footer: PlwFooter): CrossFieldResult {
+export function validateFooterCrossFields(footer: Footer): CrossFieldResult {
   if (footer.write_set.length === 0) return { ok: true };
   if (!footer.root_cause || footer.root_cause.trim().length === 0) {
     return { ok: false, reason: "root_cause required when write_set is non-empty" };
@@ -113,7 +107,7 @@ export function validateFooterCrossFields(footer: PlwFooter): CrossFieldResult {
  *     → structured_output populated correctly
  */
 export function footerSchemaJson(): string {
-  const schema = z.toJSONSchema(PlwFooterSchema) as Record<string, unknown>;
+  const schema = z.toJSONSchema(FooterSchema) as Record<string, unknown>;
   delete schema["$schema"];
   return JSON.stringify(schema);
 }
