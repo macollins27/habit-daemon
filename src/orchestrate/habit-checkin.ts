@@ -55,6 +55,7 @@ import { buildL3StakesTemplate } from "../lib/prompt-templates/level-3-stakes.js
 import { buildL3BodyDataTemplate } from "../lib/prompt-templates/level-3-body-data.js";
 import { buildL3PatternTemplate } from "../lib/prompt-templates/level-3-pattern.js";
 import { LEVEL_4_TEMPLATE } from "../lib/prompt-templates/level-4.js";
+import { LEVEL_5_TEMPLATE } from "../lib/prompt-templates/level-5.js";
 import {
   selectWell,
   type MissReason,
@@ -257,9 +258,11 @@ function selectLevelTemplate(
     }
     case 4:
       return LEVEL_4_TEMPLATE;
+    case 5:
+      return LEVEL_5_TEMPLATE;
     default:
       throw new Error(
-        `habit-checkin currentLevel=${currentLevel} is not supported yet (L1-L4 wired)`,
+        `habit-checkin currentLevel=${currentLevel} is not supported yet (L1-L5 wired)`,
       );
   }
 }
@@ -551,6 +554,19 @@ export async function runHabitCheckin(
 
   const levelTemplate = selectLevelTemplate(currentLevel, { wellSelection });
 
+  // L5 is the TERMINAL escalation step for morning-row / strength-mwf —
+  // after dispatch the run flips to status='missed' and next_escalation_at
+  // becomes NULL. wind-down has no L5 (design § 3 says wind-down closes at
+  // L4); fail-fast here so the verb is side-effect-free for unsupported
+  // (habit, level=5) combinations. Task 36/37 owns wind-down's L4 terminal
+  // state evaluation — that lives in a different verb.
+  const isTerminalLevel = currentLevel === 5;
+  if (isTerminalLevel && habit.id === "wind-down") {
+    throw new Error(
+      "habit-checkin L5 is not supported for wind-down (terminates at L4)",
+    );
+  }
+
   // Fail-fast cadence lookup: resolve the (habit, level) → delta minutes
   // entry BEFORE we dispatch the model or post to Discord. Both
   // selectLevelTemplate above and getEscalationDeltaMinutes here throw for
@@ -558,7 +574,13 @@ export async function runHabitCheckin(
   // lookups upfront keeps the verb side-effect-free when an invalid combo
   // is asked for. The resolved delta is reused below to compute
   // nextEscalationAt — single call, single source of truth.
-  const deltaMinutes = getEscalationDeltaMinutes(habit.id, currentLevel);
+  //
+  // L5 skips the lookup entirely: there is no L5→L6 entry in the cadence
+  // table because L5 is terminal. The DB transaction sets
+  // next_escalation_at = NULL directly.
+  const deltaMinutes = isTerminalLevel
+    ? 0
+    : getEscalationDeltaMinutes(habit.id, currentLevel);
 
   const recentEvents = loadRecentEventsForHabit(sessionStore, habit.id);
 
@@ -618,16 +640,32 @@ export async function runHabitCheckin(
   //    `deltaMinutes` was resolved upfront (fail-fast at step 3) — the
   //    model's suggested next_check_in_iso is ignored in Phase A (design
   //    § 3 owns cadence).
+  //
+  //    L5 is terminal: current_level stays at 5, next_escalation_at = NULL,
+  //    status flips to 'missed'. L1-L4 advance current_level + 1 and
+  //    compute next_escalation_at from the per-habit cadence. The event
+  //    payload carries `terminal: true` at L5 so downstream queries can
+  //    locate the closing event without re-walking the chain.
   // ---------------------------------------------------------------------------
-  const nextEscalationAt = now + deltaMinutes * 60 * 1000;
-  const newLevel = currentLevel + 1;
+  const nextEscalationAt = isTerminalLevel
+    ? null
+    : now + deltaMinutes * 60 * 1000;
+  const newLevel = isTerminalLevel ? currentLevel : currentLevel + 1;
 
   const persist = db.transaction(() => {
-    db.prepare(
-      `UPDATE habit_runs
-          SET current_level = ?, next_escalation_at = ?
-        WHERE id = ?`,
-    ).run(newLevel, nextEscalationAt, runId);
+    if (isTerminalLevel) {
+      db.prepare(
+        `UPDATE habit_runs
+            SET current_level = ?, next_escalation_at = NULL, status = 'missed'
+          WHERE id = ?`,
+      ).run(newLevel, runId);
+    } else {
+      db.prepare(
+        `UPDATE habit_runs
+            SET current_level = ?, next_escalation_at = ?
+          WHERE id = ?`,
+      ).run(newLevel, nextEscalationAt, runId);
+    }
 
     if (calloutFired) {
       db.prepare(
@@ -640,16 +678,19 @@ export async function runHabitCheckin(
     // The L3 dispatch carries `well` (+ `stake` when stakes is chosen, +
     // `anomalousSignals` for body_data, + `slugPrefix`/`patternCount` for
     // pattern) so the next L3 invocation can find this usage via
-    // json_extract and rotate / dedup. L1/L2 omit these fields entirely —
-    // aat-chain.jsonCanonicalize rejects `undefined` keys, so we use a
-    // conditional spread (the same pattern Task 19's
-    // vision-rejection-counter uses).
+    // json_extract and rotate / dedup. L1/L2/L4 omit these fields entirely;
+    // L5 adds `terminal: true` so Phase B's post-miss interview engine and
+    // the Sunday-review query can locate the closing event without
+    // re-walking the chain. aat-chain.jsonCanonicalize rejects `undefined`
+    // keys, so each optional field is conditionally spread (the same
+    // pattern Task 19's vision-rejection-counter uses).
     const eventPayload: Record<string, unknown> = {
       habitId: habit.id,
       runId,
       level: currentLevel,
       messageText,
       calloutFired,
+      ...(isTerminalLevel ? { terminal: true } : {}),
       ...(wellSelection !== undefined ? { well: wellSelection.well } : {}),
       ...(wellSelection !== undefined && wellSelection.well === "stakes"
         ? { stake: wellSelection.stake }
