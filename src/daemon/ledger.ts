@@ -187,7 +187,8 @@ export class Ledger {
                             CHECK(missed_run_policy IN ('skip','catchup','fail')),
         enabled             INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
         last_run_iso        TEXT,
-        next_run_iso        TEXT
+        next_run_iso        TEXT,
+        dispatch_priority   INTEGER NOT NULL DEFAULT 100
       );
     `);
   }

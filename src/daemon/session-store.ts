@@ -10,6 +10,33 @@ import { buildRecord, type AatRecord, type TrustLevel } from "./aat-chain.js";
 
 export type SessionStatus = "active" | "completed" | "failed" | "aborted";
 
+/**
+ * Allowed values for `session_events.event_type`. 15 of these come from the
+ * design doc § 2 (habit-daemon-design.md, session_events extension list) and
+ * `sensor_failure_logged` comes from Phase A plan Task 15. The SQLite CHECK
+ * constraint on `session_events.event_type` is "NULL OR IN (these 16 values)";
+ * new code MUST pass one of these literals via `SessionStore.append()`. The
+ * column remains nullable to allow infrastructure-level events (carried over
+ * from the predecessor fork) that predate this typed taxonomy.
+ */
+export type SessionEventType =
+  | "habit_prompt_sent"
+  | "habit_user_response"
+  | "habit_proof_received"
+  | "habit_completed"
+  | "habit_missed"
+  | "habit_skip_requested"
+  | "habit_dodge_requested"
+  | "proof_attempt_rejected"
+  | "proposal_emitted"
+  | "proposal_applied"
+  | "proposal_rejected"
+  | "proposal_discussion_opened"
+  | "proposal_discussion_message"
+  | "proposal_resolved"
+  | "plan_change_applied"
+  | "sensor_failure_logged";
+
 export interface SessionRow {
   readonly session_id: string;
   readonly created_iso: string;
@@ -66,6 +93,14 @@ export class SessionStore {
         prev_hash     TEXT,
         hash          TEXT NOT NULL,
         trust_level   TEXT NOT NULL CHECK(trust_level IN ('L0','L1','L2','L3','L4')),
+        event_type    TEXT CHECK(event_type IS NULL OR event_type IN (
+          'habit_prompt_sent', 'habit_user_response', 'habit_proof_received',
+          'habit_completed', 'habit_missed', 'habit_skip_requested',
+          'habit_dodge_requested', 'proof_attempt_rejected', 'proposal_emitted',
+          'proposal_applied', 'proposal_rejected', 'proposal_discussion_opened',
+          'proposal_discussion_message', 'proposal_resolved', 'plan_change_applied',
+          'sensor_failure_logged'
+        )),
         written_iso   TEXT NOT NULL,
         UNIQUE(session_id, seq)
       );
@@ -114,8 +149,17 @@ export class SessionStore {
    * Anthropic SessionStore.append — append an event with hash chain.
    * Computes prev_hash from the latest event in the session (or null for seq=0).
    * Returns the inserted row id.
+   *
+   * `eventType` is a typed taxonomy label persisted in the
+   * `session_events.event_type` column. The SQLite CHECK constraint enforces
+   * it is one of `SessionEventType`'s 16 values; passing anything else throws.
    */
-  append(sessionId: string, event: unknown, opts: AppendOptions): number {
+  append(
+    sessionId: string,
+    eventType: SessionEventType,
+    event: unknown,
+    opts: AppendOptions,
+  ): number {
     return this.db.transaction(() => {
       this.createSession(sessionId);
       const last = this.db
@@ -130,8 +174,8 @@ export class SessionStore {
       const result = this.db
         .prepare(
           `INSERT INTO session_events
-             (session_id, seq, event_json, prev_hash, hash, trust_level, written_iso)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+             (session_id, seq, event_json, prev_hash, hash, trust_level, event_type, written_iso)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           sessionId,
@@ -140,6 +184,7 @@ export class SessionStore {
           record.prevHash,
           record.hash,
           record.trustLevel,
+          eventType,
           record.writtenIso,
         );
       return Number(result.lastInsertRowid);
