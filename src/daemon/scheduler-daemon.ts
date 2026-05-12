@@ -31,7 +31,6 @@
 
 import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { Ledger } from "./ledger.js";
 import { schedulerTick, type DispatchFn } from "./scheduler.js";
 import {
@@ -121,12 +120,19 @@ export interface LoopContext {
 }
 
 /**
- * Single tick of the daemon loop. Exposed (via `loop`) for testability per
- * Task 4 spec. Schedules the next tick via setTimeout, so calling once
- * starts a self-recurring loop.
+ * Build a single-tick daemon loop bound to a closure-encapsulated WAL
+ * checkpoint timestamp. Exported for testability per Task 4 spec: tests drive
+ * one iteration via `createLoop(ctx)()`. Each call to `createLoop` produces
+ * an independent loop with its own WAL checkpoint clock, so multiple loops
+ * can coexist in one process without sharing module-level mutable state.
+ *
+ * The returned function schedules the next tick via setTimeout, so invoking
+ * it once starts a self-recurring loop.
  */
-export function loop(ctx: LoopContext): void {
-  const runIteration = async (): Promise<void> => {
+export function createLoop(ctx: LoopContext): () => Promise<void> {
+  let lastWalCheckpointMs = Date.now();
+
+  async function loop(): Promise<void> {
     if (ctx.shouldStop()) {
       ctx.ledger.close();
       info("clean shutdown complete");
@@ -151,23 +157,17 @@ export function loop(ctx: LoopContext): void {
       err(`tick exception: ${msg}`);
     }
     setTimeout(() => {
-      loop(ctx);
+      // setTimeout callback can't be async directly; wrap with a .catch so a
+      // rejected promise inside loop() doesn't become an unhandledRejection.
+      loop().catch((e: unknown) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        err(`loop iteration exception: ${msg}`);
+      });
     }, ctx.tickIntervalSec * 1000);
-  };
+  }
 
-  // setTimeout callback can't be async directly; wrap with a .catch so a
-  // rejected promise inside runIteration doesn't become an unhandledRejection.
-  runIteration().catch((e: unknown) => {
-    const msg = e instanceof Error ? e.message : String(e);
-    err(`loop iteration exception: ${msg}`);
-    setTimeout(() => {
-      loop(ctx);
-    }, ctx.tickIntervalSec * 1000);
-  });
+  return loop;
 }
-
-// Module-level WAL checkpoint timestamp shared across loop iterations.
-let lastWalCheckpointMs = Date.now();
 
 function main(): void {
   const tickIntervalSec = clampInterval(process.env.PLW_TICK_INTERVAL_SEC, 30, 10);
@@ -201,9 +201,7 @@ function main(): void {
     onSignal("SIGINT");
   });
 
-  lastWalCheckpointMs = Date.now();
-
-  loop({
+  const loop = createLoop({
     ledger,
     dispatch,
     heartbeatPath,
@@ -211,16 +209,26 @@ function main(): void {
     walCheckpointSec,
     shouldStop: () => stop,
   });
+  loop().catch((e: unknown) => {
+    const msg = e instanceof Error ? e.message : String(e);
+    err(`initial loop iteration exception: ${msg}`);
+  });
 }
 
-// Run only when invoked as a script. ESM equivalent of require.main === module.
-// Importing this module from a test (Task 4 smoke + future tests) must not
-// auto-start the daemon.
+// Run main() only when this file is the entry point. ESM equivalent of
+// require.main === module. Importing this module from a test (Task 4 smoke +
+// future tests) must not auto-start the daemon.
+//
+// The primary check compares import.meta.url against process.argv[1]; the
+// .endsWith("scheduler-daemon.js") fallback is defensive against macOS
+// launchd / systemd symlink-path differences where the resolved absolute
+// path may not byte-for-byte match the file:// URL form. The .ts fallback
+// was dropped: production never runs TS source directly post-build, and the
+// in-process test (tests/daemon/scheduler-smoke.test.ts) imports rather
+// than execs this file.
 const invokedDirectly =
   import.meta.url === `file://${process.argv[1] ?? ""}` ||
-  (process.argv[1] !== undefined &&
-    (process.argv[1].endsWith("scheduler-daemon.js") ||
-      process.argv[1].endsWith("scheduler-daemon.ts")));
+  process.argv[1]?.endsWith("scheduler-daemon.js") === true;
 
 if (invokedDirectly) {
   main();
