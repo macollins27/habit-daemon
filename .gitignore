@@ -1,0 +1,7 @@
+node_modules/
+dist/
+habit-state.db*
+.env
+~/.habit-daemon/
+.DS_Store
+*.log

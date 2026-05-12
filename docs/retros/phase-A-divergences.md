@@ -69,4 +69,14 @@ The venv path is part of the host's `~/.habit-daemon/` credential surface, not t
 
 ---
 
+## 6. Task 1 adds `src/index.ts` placeholder so `tsc` build step is satisfied
+
+**Source:** `docs/plans/2026-05-12-phase-a-implementation.md` Task 1 file list + handoff guidance "outcome must be: pnpm gate passes".
+
+The Task 1 file list names 6 files (`package.json`, `tsconfig.json`, `vitest.config.ts`, `.gitignore`, `.nvmrc`, `tests/smoke.test.ts`) and specifies `rootDir=src` in `tsconfig.json`. With no `src/**/*` inputs, `tsc` fails with `TS18003: No inputs were found in config file`, which breaks `pnpm build` and therefore `pnpm gate`. The handoff anticipates this and grants judgment as long as gate stays green.
+
+**Resolution:** Task 1 commit adds one extra file, `src/index.ts`, containing only `export {};` and a comment marking it as a placeholder. Subsequent Phase A tasks that introduce real entry-point code (daemon bootstrap, CLI) overwrite it as they land. No tsconfig change; rootDir stays `src` per spec.
+
+---
+
 End of divergence log. Append new divergences above this line, in numerical order.
