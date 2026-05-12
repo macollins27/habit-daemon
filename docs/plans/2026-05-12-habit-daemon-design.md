@@ -316,7 +316,7 @@ a single run, bot posts: "That's three photos that aren't the
 
 ### Concept2 Logbook API flow (`src/lib/concept2-adapter.ts`)
 
-- One-time setup: register OAuth client at log-dev.concept2.com →
+- One-time setup: register OAuth client at log.concept2.com/developers/keys →
   `CLIENT_ID + CLIENT_SECRET` → store at
   `~/.habit-daemon/concept2-credentials.json`.
 - One-time user auth: daemon prints auth URL → user authorizes in browser →
@@ -695,7 +695,7 @@ When a soak run fails any pass criterion, retro classifies the root cause:
 
 - Register Discord bot at discord.com/developers, create application,
   generate bot token, add to private server with admin permissions.
-- Register Concept2 OAuth client at log-dev.concept2.com → `CLIENT_ID` +
+- Register Concept2 OAuth client at log.concept2.com/developers/keys → `CLIENT_ID` +
   `CLIENT_SECRET`.
 - Run `scripts/garmin_fetch.py --login` once with email + password + MFA
   code to seed `~/.garminconnect/` token cache.

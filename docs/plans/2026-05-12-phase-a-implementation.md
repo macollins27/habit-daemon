@@ -918,7 +918,7 @@ WantedBy=multi-user.target
 These are prerequisites, executed manually before Task 1:
 
 1. Register Discord bot at https://discord.com/developers/applications. Create application, generate bot token. Add bot to private server with `Manage Channels`, `Send Messages`, `Read Message History`, `Embed Links`, `Attach Files`, `Add Reactions` permissions. Capture: `DISCORD_BOT_TOKEN`, channel IDs for `#morning-row`, `#strength`, `#wind-down`, `#wins`, `#sunday-review`.
-2. Register Concept2 OAuth client at https://log-dev.concept2.com. Capture `CLIENT_ID` and `CLIENT_SECRET`. Write to `~/.habit-daemon/concept2-credentials.json` (mode 0600).
+2. Register Concept2 OAuth client at https://log.concept2.com/developers/keys. Capture `CLIENT_ID` and `CLIENT_SECRET`. Write to `~/.habit-daemon/concept2-credentials.json` (mode 0600).
 3. Run `pip install garminconnect` (Python 3.11+).
 4. Test Garmin login interactively: `python scripts/garmin_fetch.py --login` (after Task 12) — completes MFA flow, seeds `~/.garminconnect/`.
 5. Configure environment via `~/.habit-daemon/env`:

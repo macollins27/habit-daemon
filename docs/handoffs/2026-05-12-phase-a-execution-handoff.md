@@ -82,7 +82,7 @@ attempt to execute them yourself:
    Links, Attach Files, Add Reactions. Capture: `DISCORD_BOT_TOKEN` and
    channel IDs for `#morning-row`, `#strength`, `#wind-down`, `#wins`,
    `#sunday-review`.
-2. **Concept2 OAuth client.** Register at https://log-dev.concept2.com.
+2. **Concept2 OAuth client.** Register at https://log.concept2.com/developers/keys.
    Capture `CLIENT_ID` and `CLIENT_SECRET`. Write to
    `~/.habit-daemon/concept2-credentials.json` (mode 0600).
 3. **Python + garminconnect.** `pip install garminconnect` (Python 3.11+).
