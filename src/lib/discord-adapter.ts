@@ -30,7 +30,9 @@ import {
   Client,
   GatewayIntentBits,
   type ClientOptions,
+  type Message,
 } from "discord.js";
+import type Database from "better-sqlite3";
 
 export type ChannelName =
   | "morning-row"
@@ -250,5 +252,151 @@ export async function postToChannel(
     messageId: message.id,
     channelId,
     postedAt: Date.now(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Task 22: inbound listener.
+//
+// `subscribeMessages` is the single inbound read path for the daemon. It
+// registers exactly one `messageCreate` listener on the discord.js Client
+// and, for every non-bot message observed in one of the three *active*
+// channels (`morning-row`, `strength`, `wind-down`), looks up the active
+// `habit_runs` row that matches:
+//
+//     habit.channel_id   == msg.channelId
+//     habit_run.fire_date == today (local time, per ADR 0001)
+//     habit_run.status   IN ('pending','partial')
+//
+// If a row is found, the caller's `handler` is invoked with
+// `{run, message, channelName}`. If no row matches, the listener is a no-op
+// — there is no active habit for this message, so it isn't ours to handle.
+//
+// The `wins` and `sunday-review` channels are bot-output-only — no listener
+// fires for messages in those channels even if the message somehow makes it
+// past Discord's permissions.
+//
+// Author matching: Phase A is single-user, so we filter only on
+// `author.bot === true` (skip bots) and accept all human messages. When the
+// design grows a per-habit user-id mapping, extend this filter.
+//
+// Async handler errors are caught and logged via `console.error` instead of
+// being allowed to propagate up the discord.js event-emitter stack. The
+// listener intentionally survives a handler crash so subsequent messages
+// still get a chance to be processed.
+// ---------------------------------------------------------------------------
+
+export interface ActiveHabitRun {
+  readonly id: string;
+  readonly habit_id: string;
+  readonly fire_date: string;
+  readonly current_level: number;
+  readonly status: "pending" | "partial";
+  readonly proof_rejection_callout_due: number;
+}
+
+export interface MessageMatch {
+  readonly run: ActiveHabitRun;
+  readonly message: Message;
+  readonly channelName: ChannelName;
+}
+
+export interface SubscribeMessagesOptions {
+  readonly adapter: DiscordAdapter;
+  readonly db: Database.Database;
+  readonly handler: (match: MessageMatch) => Promise<void> | void;
+  // Injectable for testing. Defaults to `() => new Date()`.
+  readonly now?: () => Date;
+}
+
+export type Unsubscribe = () => void;
+
+// The three channels the daemon actually listens to. `wins` and
+// `sunday-review` are bot-output-only.
+const ACTIVE_CHANNEL_NAMES: readonly ChannelName[] = [
+  "morning-row",
+  "strength",
+  "wind-down",
+];
+
+function buildActiveChannelLookup(
+  channelIds: DiscordChannelIds,
+): ReadonlyMap<string, ChannelName> {
+  const map = new Map<string, ChannelName>();
+  for (const name of ACTIVE_CHANNEL_NAMES) {
+    map.set(channelIds[name], name);
+  }
+  return map;
+}
+
+// YYYY-MM-DD in process local time. Matches the daemon's `fire_date`
+// writer (ADR 0001: cron expressions are interpreted in local time).
+function localDateString(now: Date): string {
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+export function subscribeMessages(opts: SubscribeMessagesOptions): Unsubscribe {
+  const { adapter, db, handler } = opts;
+  const nowFn = opts.now ?? (() => new Date());
+
+  const activeChannels = buildActiveChannelLookup(adapter.channelIds);
+
+  // Single-row lookup. Joining channel_id → habit_id inline keeps the
+  // listener stateless: no in-memory cache of habit rows to keep coherent
+  // with schema changes (Phase B plan-change pipeline).
+  const lookupRun = db.prepare(
+    `SELECT id, habit_id, fire_date, current_level, status,
+            proof_rejection_callout_due
+       FROM habit_runs
+      WHERE habit_id = (SELECT id FROM habits WHERE channel_id = ?)
+        AND fire_date = ?
+        AND status IN ('pending', 'partial')
+      LIMIT 1`,
+  );
+
+  const onMessage = (msg: Message): void => {
+    // discord.js's Message.author can be null in exotic webhook cases. The
+    // optional chain plus `?? false` collapses both "no author" and
+    // "human author" into "do not skip".
+    if (msg.author?.bot === true) return;
+
+    const channelName = activeChannels.get(msg.channelId);
+    if (channelName === undefined) return;
+
+    const today = localDateString(nowFn());
+    const row = lookupRun.get(adapter.channelIds[channelName], today) as
+      | ActiveHabitRun
+      | undefined;
+    if (row === undefined) return;
+
+    const match: MessageMatch = {
+      run: row,
+      message: msg,
+      channelName,
+    };
+
+    let result: Promise<void> | void;
+    try {
+      result = handler(match);
+    } catch (err: unknown) {
+      // Synchronous throw from handler — log and swallow.
+      console.error("[discord-listener] handler threw synchronously", err);
+      return;
+    }
+
+    if (result && typeof (result as Promise<void>).catch === "function") {
+      (result as Promise<void>).catch((err: unknown) => {
+        console.error("[discord-listener] handler rejected", err);
+      });
+    }
+  };
+
+  adapter.client.on("messageCreate", onMessage);
+
+  return () => {
+    adapter.client.off("messageCreate", onMessage);
   };
 }
