@@ -174,6 +174,20 @@ describe("saveTokens()", () => {
     const mode = statSync(p).mode & 0o777;
     expect(mode).toBe(0o600);
   });
+
+  it("creates missing parent directories with mode 0700", () => {
+    const nestedPath = join(dir, "nested", "deeper", "tokens.json");
+
+    expect(() => saveTokens(sample, nestedPath)).not.toThrow();
+
+    const parsed = JSON.parse(
+      readFileSync(nestedPath, "utf8")
+    ) as Concept2Tokens;
+    expect(parsed).toEqual(sample);
+
+    const parentMode = statSync(join(dir, "nested", "deeper")).mode & 0o777;
+    expect(parentMode).toBe(0o700);
+  });
 });
 
 describe("buildAuthorizationUrl()", () => {
@@ -368,5 +382,29 @@ describe("exchangeCodeForTokens()", () => {
         fetchImpl,
       })
     ).rejects.toThrow(/expires_in/);
+  });
+
+  it("throws when the response is missing scope", async () => {
+    const recorder: { last?: RecordedRequest } = {};
+    const fetchImpl = makeFetchMock(
+      {
+        ok: true,
+        body: {
+          access_token: "AT",
+          refresh_token: "RT",
+          expires_in: 3600,
+          token_type: "Bearer",
+        },
+      },
+      recorder
+    );
+
+    await expect(
+      exchangeCodeForTokens({
+        credentials: VALID_CREDS,
+        code: "X",
+        fetchImpl,
+      })
+    ).rejects.toThrow(/scope/);
   });
 });

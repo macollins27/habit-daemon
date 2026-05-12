@@ -16,9 +16,9 @@
 // without env shims: callers (including the CLI) can override paths by
 // passing them as parameters, and tests use `mkdtempSync` for isolation.
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export interface Concept2Credentials {
   readonly client_id: string;
@@ -101,6 +101,12 @@ export function loadCredentials(path?: string): Concept2Credentials {
 
 export function saveTokens(tokens: Concept2Tokens, path?: string): void {
   const resolved = path ?? tokensPath();
+  // The parent directory (~/.habit-daemon/ by default) is a credential
+  // surface and must be restrictive. mkdirSync with recursive:true is a
+  // no-op when the directory already exists. We do this BEFORE the
+  // network exchange completes so a fresh-machine ENOENT cannot waste
+  // the one-shot OAuth authorization code by failing the final write.
+  mkdirSync(dirname(resolved), { recursive: true, mode: 0o700 });
   const body = JSON.stringify(tokens, null, 2);
   writeFileSync(resolved, body, { encoding: "utf8", mode: 0o600 });
 }
@@ -166,13 +172,15 @@ export async function exchangeCodeForTokens(
       `Concept2 token response token_type must be Bearer, got ${String(parsed.token_type)}`
     );
   }
-  const scope = isNonEmptyString(parsed.scope) ? parsed.scope : SCOPE;
+  if (!isNonEmptyString(parsed.scope)) {
+    throw new Error("Concept2 token response missing scope field");
+  }
 
   return {
     access_token: parsed.access_token,
     refresh_token: parsed.refresh_token,
     expires_at: Date.now() + parsed.expires_in * 1000,
     token_type: "Bearer",
-    scope,
+    scope: parsed.scope,
   };
 }
