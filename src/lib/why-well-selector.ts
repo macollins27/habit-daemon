@@ -19,6 +19,10 @@
 //     schema) and § 3 (L3 WHY-well selection logic)
 
 import type { HabitContext, RunContext } from "./prompt-builder.js";
+import {
+  detectPriorNightAnomaly,
+  detectTrailingWeekAnomaly,
+} from "./anomaly-detector.js";
 
 // ------------------------------------------------------------------------
 // Public types
@@ -109,15 +113,10 @@ const ROTATION_ORDER: readonly StakeName[] = [
   "tertiary",
 ];
 
-// Heuristics for the trailing_week_trend body-data check. These are
-// pragmatic Phase A defaults documented in docs/plans/...phase-a... § Task 26.
-const TIME_OF_DAY_DELTA_MIN_THRESHOLD = 30;
-const NUMERIC_DELTA_RATIO_THRESHOLD = 0.1; // 10%
-
-// Time-of-day signals are stored as "HH:MM" strings. Everything else is a
-// numeric minutes/count/index. The signal-extractor maps each signal name
-// to its numeric value (or null when absent / unparseable).
-const TIME_OF_DAY_SIGNALS = new Set<string>(["sleep_onset_time"]);
+// Body-data heuristics live in src/lib/anomaly-detector.ts (Task 28). The
+// selector calls into that module via `detectPriorNightAnomaly` and
+// `detectTrailingWeekAnomaly` — the thresholds and edge-case rules are
+// codified there.
 
 // ------------------------------------------------------------------------
 // Type narrowing helpers
@@ -217,156 +216,23 @@ function tryPattern(ctx: WellSelectionContext): PatternPayload | null {
 
 // ------------------------------------------------------------------------
 // Body-data branch
+//
+// The actual anomaly heuristics (prior-night bottom-20% and trailing-week
+// trend) live in src/lib/anomaly-detector.ts. The selector handles habit-
+// level routing — pulling the signal_mode from why_stakes, computing the
+// prior-night date, and packaging the result into a `BodyDataPayload`.
 // ------------------------------------------------------------------------
 
-/**
- * Extract a numeric value for a body-data signal name out of a parsed Garmin
- * sensor payload. Time-of-day strings ("HH:MM") are converted to
- * minutes-from-midnight so deltas are comparable to numeric signals.
- *
- * Returns null when the field is missing, the wrong type, or unparseable.
- */
-function extractSignalValue(
-  payload: Record<string, unknown>,
-  signalName: string,
-): number | null {
-  const sleep = readObject(payload, "sleep");
-  if (!sleep) return null;
-  const raw = sleep[signalName];
-
-  if (TIME_OF_DAY_SIGNALS.has(signalName)) {
-    if (typeof raw !== "string") return null;
-    const m = /^(\d{1,2}):(\d{2})$/.exec(raw);
-    if (!m) return null;
-    const h = Number(m[1]);
-    const mi = Number(m[2]);
-    if (!Number.isFinite(h) || !Number.isFinite(mi)) return null;
-    return h * 60 + mi;
-  }
-
-  return typeof raw === "number" && Number.isFinite(raw) ? raw : null;
-}
-
-function parsePayload(signal: SensorSignal): Record<string, unknown> | null {
-  try {
-    const parsed = JSON.parse(signal.payload_json);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
-      return null;
-    return parsed as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
-function priorNightAnomalies(
-  ctx: WellSelectionContext,
-  relevantSignals: readonly string[],
-): readonly string[] {
-  // Prior night = the night before run.fire_date. We treat fire_date as
-  // YYYY-MM-DD and subtract one day.
-  const fireDateParts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ctx.run.fire_date);
-  if (!fireDateParts) return [];
+export function computePriorDate(fireDate: string): string | null {
+  const fireDateParts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(fireDate);
+  if (!fireDateParts) return null;
   const fireDateMs = Date.UTC(
     Number(fireDateParts[1]),
     Number(fireDateParts[2]) - 1,
     Number(fireDateParts[3]),
   );
   const priorMs = fireDateMs - DAY_MS;
-  const priorDate = new Date(priorMs).toISOString().slice(0, 10);
-
-  const garmin = ctx.sensorSignals.filter((s) => s.source === "garmin");
-  const priorSignal = garmin.find((s) => s.payload_date === priorDate);
-  if (!priorSignal) return [];
-
-  const priorPayload = parsePayload(priorSignal);
-  if (!priorPayload) return [];
-
-  // Trailing 30-day baseline = the 30 Garmin signals before prior-night
-  // (exclusive). Pull values per signal, sort, take the 20th percentile.
-  const baseline = garmin.filter(
-    (s) => s.payload_date !== priorDate && s.payload_date < priorDate,
-  );
-
-  const anomalies: string[] = [];
-  for (const sig of relevantSignals) {
-    const priorVal = extractSignalValue(priorPayload, sig);
-    if (priorVal === null) continue;
-
-    const baselineVals: number[] = [];
-    for (const b of baseline) {
-      const p = parsePayload(b);
-      if (!p) continue;
-      const v = extractSignalValue(p, sig);
-      if (v !== null) baselineVals.push(v);
-    }
-    if (baselineVals.length < 5) continue; // Insufficient baseline.
-
-    baselineVals.sort((a, b) => a - b);
-    // 20th-percentile threshold using nearest-rank (no interpolation).
-    const idx = Math.max(0, Math.floor(0.2 * baselineVals.length) - 1);
-    const threshold = baselineVals[idx];
-    if (typeof threshold !== "number") continue;
-
-    if (priorVal < threshold) {
-      anomalies.push(sig);
-    }
-  }
-  return anomalies;
-}
-
-function trailingWeekAnomalies(
-  ctx: WellSelectionContext,
-  relevantSignals: readonly string[],
-): readonly string[] {
-  // 7-day rolling vs prior 30-day baseline. We treat "last 7 days" as the
-  // 7 most-recent Garmin signals and "30-day baseline" as the 23 signals
-  // BEFORE that — design wording is ambiguous but consistent with the
-  // "(avg of last 7d) vs (avg of trailing 30d, excluding last 7d)" spec
-  // in task 26.
-  const garmin = [...ctx.sensorSignals]
-    .filter((s) => s.source === "garmin")
-    .sort((a, b) => b.payload_date.localeCompare(a.payload_date)); // newest first
-
-  if (garmin.length < 14) return []; // need both windows populated
-
-  const last7 = garmin.slice(0, 7);
-  const prior = garmin.slice(7, 30);
-  if (prior.length < 5) return [];
-
-  const anomalies: string[] = [];
-  for (const sig of relevantSignals) {
-    const collect = (sigs: readonly SensorSignal[]): number[] => {
-      const out: number[] = [];
-      for (const s of sigs) {
-        const p = parsePayload(s);
-        if (!p) continue;
-        const v = extractSignalValue(p, sig);
-        if (v !== null) out.push(v);
-      }
-      return out;
-    };
-    const recent = collect(last7);
-    const baseline = collect(prior);
-    if (recent.length === 0 || baseline.length === 0) continue;
-
-    const avg = (xs: readonly number[]): number =>
-      xs.reduce((a, b) => a + b, 0) / xs.length;
-    const recentAvg = avg(recent);
-    const baselineAvg = avg(baseline);
-    const delta = Math.abs(recentAvg - baselineAvg);
-
-    if (TIME_OF_DAY_SIGNALS.has(sig)) {
-      if (delta > TIME_OF_DAY_DELTA_MIN_THRESHOLD) anomalies.push(sig);
-    } else {
-      const denom = Math.abs(baselineAvg);
-      if (denom === 0) {
-        if (delta > 0) anomalies.push(sig);
-      } else if (delta / denom > NUMERIC_DELTA_RATIO_THRESHOLD) {
-        anomalies.push(sig);
-      }
-    }
-  }
-  return anomalies;
+  return new Date(priorMs).toISOString().slice(0, 10);
 }
 
 function tryBodyData(ctx: WellSelectionContext): BodyDataPayload | null {
@@ -379,10 +245,21 @@ function tryBodyData(ctx: WellSelectionContext): BodyDataPayload | null {
   const relevantSignals = readStringArray(bodyDataWell, "relevant_signals");
   if (relevantSignals.length === 0) return null;
 
-  const anomalies =
-    mode === "prior_night"
-      ? priorNightAnomalies(ctx, relevantSignals)
-      : trailingWeekAnomalies(ctx, relevantSignals);
+  const garminSignals = ctx.sensorSignals.filter((s) => s.source === "garmin");
+
+  let anomalies: readonly string[];
+  if (mode === "prior_night") {
+    const priorDate = computePriorDate(ctx.run.fire_date);
+    if (priorDate === null) return null;
+    anomalies = detectPriorNightAnomaly(
+      garminSignals,
+      relevantSignals,
+      priorDate,
+    ).anomalousSignals;
+  } else {
+    anomalies = detectTrailingWeekAnomaly(garminSignals, relevantSignals)
+      .anomalousSignals;
+  }
 
   if (anomalies.length === 0) return null;
 

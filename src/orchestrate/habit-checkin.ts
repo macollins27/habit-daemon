@@ -52,6 +52,7 @@ import {
 import { LEVEL_1_TEMPLATE } from "../lib/prompt-templates/level-1.js";
 import { LEVEL_2_TEMPLATE } from "../lib/prompt-templates/level-2.js";
 import { buildL3StakesTemplate } from "../lib/prompt-templates/level-3-stakes.js";
+import { buildL3BodyDataTemplate } from "../lib/prompt-templates/level-3-body-data.js";
 import {
   selectWell,
   type MissReason,
@@ -243,9 +244,7 @@ function selectLevelTemplate(
         case "stakes":
           return buildL3StakesTemplate(opts.wellSelection);
         case "body_data":
-          throw new Error(
-            "habit-checkin L3 body_data template not yet wired (Task 28)",
-          );
+          return buildL3BodyDataTemplate(opts.wellSelection);
         case "pattern":
           throw new Error(
             "habit-checkin L3 pattern template not yet wired (Task 29)",
@@ -641,6 +640,9 @@ export async function runHabitCheckin(
       ...(wellSelection !== undefined ? { well: wellSelection.well } : {}),
       ...(wellSelection !== undefined && wellSelection.well === "stakes"
         ? { stake: wellSelection.stake }
+        : {}),
+      ...(wellSelection !== undefined && wellSelection.well === "body_data"
+        ? { anomalousSignals: wellSelection.anomalousSignals }
         : {}),
     };
 

@@ -636,61 +636,6 @@ describe("runHabitCheckin() at L3 — stakes_well rotation", () => {
     expect(row?.next_escalation_at).toBeNull();
   });
 
-  it("L3 body_data_well not yet wired: prior-night anomaly → throws Task 28 message", async () => {
-    seedHabitRun(db, {
-      runId: "run-mr-l3-body",
-      habitId: "morning-row",
-      currentLevel: 3,
-    });
-    // Seed Garmin baseline (30 days) — all "high" values for rem_minutes —
-    // plus a prior-night row that is far below the 20th percentile so
-    // tryBodyData() detects an anomaly. Garmin payload_dates are
-    // YYYY-MM-DD; the prior night relative to fire_date 2026-05-12 is
-    // 2026-05-11.
-    const insert = db.prepare(
-      `INSERT INTO sensor_signals (id, source, payload_date, payload_json, fetched_at)
-       VALUES (?, ?, ?, ?, ?)`,
-    );
-    // Baseline: 30 days of payload_date < 2026-05-11 with rem_minutes=120.
-    for (let i = 0; i < 30; i += 1) {
-      const d = new Date(NOW_MS - (i + 2) * DAY_MS);
-      const ymd = d.toISOString().slice(0, 10);
-      insert.run(
-        `ss-baseline-${i}`,
-        "garmin",
-        ymd,
-        JSON.stringify({ sleep: { rem_minutes: 120 } }),
-        NOW_MS - (i + 2) * DAY_MS,
-      );
-    }
-    // Prior night: rem_minutes = 10 (far below 20th percentile of 120s).
-    insert.run(
-      "ss-prior-night",
-      "garmin",
-      "2026-05-11",
-      JSON.stringify({ sleep: { rem_minutes: 10 } }),
-      NOW_MS - DAY_MS,
-    );
-    const { adapter, mockSend } = buildAdapter();
-    const { impl } = happyDispatch();
-    const eventsBefore = countEvents(db);
-
-    await expect(
-      runHabitCheckin({
-        sessionStore,
-        adapter,
-        sessionId: SESSION_ID,
-        runId: "run-mr-l3-body",
-        currentLevel: 3,
-        now: NOW_MS,
-        dispatchImpl: impl,
-      }),
-    ).rejects.toThrowError(/Task 28/);
-
-    expect(mockSend).not.toHaveBeenCalled();
-    expect(countEvents(db)).toBe(eventsBefore);
-  });
-
   it("wind-down L3: next_escalation_at = now + 2 min", async () => {
     seedHabitRun(db, {
       runId: "run-wd-l3",
