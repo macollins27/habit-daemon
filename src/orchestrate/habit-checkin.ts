@@ -51,6 +51,14 @@ import {
 } from "../lib/prompt-builder.js";
 import { LEVEL_1_TEMPLATE } from "../lib/prompt-templates/level-1.js";
 import { LEVEL_2_TEMPLATE } from "../lib/prompt-templates/level-2.js";
+import { buildL3StakesTemplate } from "../lib/prompt-templates/level-3-stakes.js";
+import {
+  selectWell,
+  type MissReason,
+  type SensorSignal,
+  type StakeName,
+  type WellSelection,
+} from "../lib/why-well-selector.js";
 
 // -----------------------------------------------------------------------------
 // Per-habit escalation cadence (design § 3).
@@ -216,17 +224,188 @@ function parseJsonRecord(s: string, label: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-function selectLevelTemplate(currentLevel: number): LevelTemplate {
+function selectLevelTemplate(
+  currentLevel: number,
+  opts?: { readonly wellSelection?: WellSelection },
+): LevelTemplate {
   switch (currentLevel) {
     case 1:
       return LEVEL_1_TEMPLATE;
     case 2:
       return LEVEL_2_TEMPLATE;
+    case 3: {
+      if (opts?.wellSelection === undefined) {
+        throw new Error(
+          "habit-checkin L3 requires a wellSelection (caller bug)",
+        );
+      }
+      switch (opts.wellSelection.well) {
+        case "stakes":
+          return buildL3StakesTemplate(opts.wellSelection);
+        case "body_data":
+          throw new Error(
+            "habit-checkin L3 body_data template not yet wired (Task 28)",
+          );
+        case "pattern":
+          throw new Error(
+            "habit-checkin L3 pattern template not yet wired (Task 29)",
+          );
+      }
+      // Exhaustive switch — TypeScript should never let us get here.
+      throw new Error(
+        `habit-checkin L3 unsupported well selection: ${JSON.stringify(opts.wellSelection)}`,
+      );
+    }
     default:
       throw new Error(
-        `habit-checkin currentLevel=${currentLevel} is not supported yet (L1 + L2 wired)`,
+        `habit-checkin currentLevel=${currentLevel} is not supported yet (L1-L3 wired)`,
       );
   }
+}
+
+// -----------------------------------------------------------------------------
+// L3 selector-context loaders.
+//
+// These queries are scoped to the trailing 30-day window the selector cares
+// about. They are pure SQL — no side effects — and run BEFORE dispatch so a
+// load failure throws atomically without touching habit_runs / session_events.
+// -----------------------------------------------------------------------------
+
+const SELECTOR_LOOKBACK_DAYS = 30;
+const SELECTOR_LOOKBACK_MS = SELECTOR_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+
+interface MissReasonRow {
+  readonly id: string;
+  readonly habit_id: string;
+  readonly run_id: string;
+  readonly miss_date: string;
+  readonly inferred_specifics: string | null;
+  readonly classification: string | null;
+  readonly created_at: number;
+}
+
+interface SensorSignalRow {
+  readonly id: string;
+  readonly source: string;
+  readonly payload_date: string;
+  readonly payload_json: string;
+  readonly fetched_at: number;
+}
+
+function loadMissReasons30d(
+  sessionStore: SessionStore,
+  habitId: string,
+  now: number,
+): readonly MissReason[] {
+  const since = now - SELECTOR_LOOKBACK_MS;
+  const rows = sessionStore.db
+    .prepare(
+      `SELECT id, habit_id, run_id, miss_date, inferred_specifics,
+              classification, created_at
+         FROM miss_reasons
+        WHERE habit_id = ?
+          AND created_at >= ?
+        ORDER BY created_at ASC`,
+    )
+    .all(habitId, since) as readonly MissReasonRow[];
+
+  return rows.map((r) => ({
+    id: r.id,
+    habit_id: r.habit_id,
+    run_id: r.run_id,
+    miss_date: r.miss_date,
+    inferred_specifics: r.inferred_specifics,
+    classification: r.classification,
+    created_at: r.created_at,
+  }));
+}
+
+function loadGarminSignals30d(
+  sessionStore: SessionStore,
+  now: number,
+): readonly SensorSignal[] {
+  const since = now - SELECTOR_LOOKBACK_MS;
+  const rows = sessionStore.db
+    .prepare(
+      `SELECT id, source, payload_date, payload_json, fetched_at
+         FROM sensor_signals
+        WHERE source = 'garmin'
+          AND fetched_at >= ?
+        ORDER BY fetched_at DESC`,
+    )
+    .all(since) as readonly SensorSignalRow[];
+
+  return rows.map((r) => ({
+    id: r.id,
+    // `source` is open per migration 002, but the selector union narrows it.
+    source: r.source === "concept2" ? "concept2" : "garmin",
+    payload_date: r.payload_date,
+    payload_json: r.payload_json,
+    fetched_at: r.fetched_at,
+  }));
+}
+
+interface LastWellEventRow {
+  readonly event_json: string;
+  readonly written_iso: string;
+}
+
+function loadLastPatternWellUseMs(
+  sessionStore: SessionStore,
+  habitId: string,
+): number | null {
+  const row = sessionStore.db
+    .prepare(
+      `SELECT event_json, written_iso
+         FROM session_events
+        WHERE event_type = 'habit_prompt_sent'
+          AND json_extract(event_json, '$.habitId') = ?
+          AND json_extract(event_json, '$.well') = 'pattern'
+        ORDER BY id DESC
+        LIMIT 1`,
+    )
+    .get(habitId) as LastWellEventRow | undefined;
+
+  if (row === undefined) return null;
+  const ms = Date.parse(row.written_iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function loadLastStakesWellUse(
+  sessionStore: SessionStore,
+  habitId: string,
+): { readonly stake: StakeName; readonly usedAtMs: number } | null {
+  const row = sessionStore.db
+    .prepare(
+      `SELECT event_json, written_iso
+         FROM session_events
+        WHERE event_type = 'habit_prompt_sent'
+          AND json_extract(event_json, '$.habitId') = ?
+          AND json_extract(event_json, '$.well') = 'stakes'
+        ORDER BY id DESC
+        LIMIT 1`,
+    )
+    .get(habitId) as LastWellEventRow | undefined;
+
+  if (row === undefined) return null;
+  const usedAtMs = Date.parse(row.written_iso);
+  if (!Number.isFinite(usedAtMs)) return null;
+
+  let stakeRaw: unknown;
+  try {
+    const parsed = JSON.parse(row.event_json) as Record<string, unknown>;
+    stakeRaw = parsed["stake"];
+  } catch {
+    return null;
+  }
+  if (
+    stakeRaw !== "primary" &&
+    stakeRaw !== "secondary" &&
+    stakeRaw !== "tertiary"
+  ) {
+    return null;
+  }
+  return { stake: stakeRaw, usedAtMs };
 }
 
 interface RecentEventsRow {
@@ -343,8 +522,33 @@ export async function runHabitCheckin(
 
   // ---------------------------------------------------------------------------
   // 3. Pick template + load recent events + build prompt.
+  //
+  //    For L3 we first run the WHY-well selector (pattern > body_data >
+  //    stakes) over trailing 30-day miss_reasons / sensor_signals and the
+  //    last-use stamps mined from session_events. The selector is a pure
+  //    function; all DB I/O happens in the loaders above.
   // ---------------------------------------------------------------------------
-  const levelTemplate = selectLevelTemplate(currentLevel);
+  let wellSelection: WellSelection | undefined;
+  if (currentLevel === 3) {
+    const missReasons30d = loadMissReasons30d(sessionStore, habit.id, now);
+    const sensorSignals = loadGarminSignals30d(sessionStore, now);
+    const lastPatternWellUseMs = loadLastPatternWellUseMs(
+      sessionStore,
+      habit.id,
+    );
+    const lastStakesWellUse = loadLastStakesWellUse(sessionStore, habit.id);
+    wellSelection = selectWell({
+      habit,
+      run,
+      now,
+      missReasons30d,
+      sensorSignals,
+      lastPatternWellUseMs,
+      lastStakesWellUse,
+    });
+  }
+
+  const levelTemplate = selectLevelTemplate(currentLevel, { wellSelection });
   const recentEvents = loadRecentEventsForHabit(sessionStore, habit.id);
 
   const prompt = buildHabitCheckinPrompt({
@@ -423,18 +627,26 @@ export async function runHabitCheckin(
       ).run(runId);
     }
 
-    sessionStore.append(
-      sessionId,
-      "habit_prompt_sent",
-      {
-        habitId: habit.id,
-        runId,
-        level: currentLevel,
-        messageText,
-        calloutFired,
-      },
-      { trustLevel: "L1" },
-    );
+    // The L3 dispatch carries `well` (+ `stake` when stakes is chosen) so the
+    // next L3 invocation can find this usage via json_extract and rotate /
+    // dedup. L1/L2 omit these fields entirely — aat-chain.jsonCanonicalize
+    // rejects `undefined` keys, so we use a conditional spread (the same
+    // pattern Task 19's vision-rejection-counter uses).
+    const eventPayload: Record<string, unknown> = {
+      habitId: habit.id,
+      runId,
+      level: currentLevel,
+      messageText,
+      calloutFired,
+      ...(wellSelection !== undefined ? { well: wellSelection.well } : {}),
+      ...(wellSelection !== undefined && wellSelection.well === "stakes"
+        ? { stake: wellSelection.stake }
+        : {}),
+    };
+
+    sessionStore.append(sessionId, "habit_prompt_sent", eventPayload, {
+      trustLevel: "L1",
+    });
   });
 
   persist();

@@ -530,11 +530,14 @@ describe("runHabitCheckin() at L1", () => {
     expect(matches).toBe(true);
   });
 
-  it("unsupported currentLevel throws (L3 not yet wired)", async () => {
+  it("unsupported currentLevel throws (L4 not yet wired)", async () => {
+    // Task 27 wired L3; L4 lands in Task 30. The verb must still reject any
+    // currentLevel above what's wired so the scheduler fails loudly rather
+    // than silently no-op'ing an escalation step.
     seedHabitRun(db, {
-      runId: "run-l3-rejected",
+      runId: "run-l4-rejected",
       habitId: "morning-row",
-      currentLevel: 3,
+      currentLevel: 4,
     });
     const { adapter } = buildAdapter();
     const { impl } = happyDispatch();
@@ -544,8 +547,8 @@ describe("runHabitCheckin() at L1", () => {
         sessionStore,
         adapter,
         sessionId: SESSION_ID,
-        runId: "run-l3-rejected",
-        currentLevel: 3,
+        runId: "run-l4-rejected",
+        currentLevel: 4,
         now: NOW_MS,
         dispatchImpl: impl,
       }),
