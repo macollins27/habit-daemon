@@ -466,17 +466,28 @@ ALTER TABLE schedules ADD COLUMN dispatch_priority INTEGER NOT NULL DEFAULT 100;
 
 ---
 
-### Task 19: Vision rejection counter
+### Task 19: Vision rejection counter (writes flag, no Discord coupling)
 
 **Files:**
 - Create: `src/orchestrate/vision-rejection-counter.ts`
 - Create: `tests/orchestrate/vision-rejection-counter.test.ts`
 
-**Behavior:** on each `verifyImage` rejection in an active run, write `proof_attempt_rejected` event to `session_events`. `next_escalation_at` UNCHANGED. Counter check: if `COUNT(*) WHERE run_id=? AND event_type='proof_attempt_rejected'` ≥ 3, dispatch a callout message via discord-adapter.
+**Architectural note:** Vision-verify must stay decoupled from discord-adapter (testable in CLI, web-admin, future v2 contexts). Vision rejection writes a flag on the habit_runs row; the next habit-checkin invocation reads the flag and includes the callout text in its prompt; the flag is reset after that dispatch. The callout fires on the next L+1 message anyway (rejections don't move `next_escalation_at`), so piggybacking on the already-scheduled dispatch is the natural moment.
 
-**Test:** seed 2 prior rejection events, simulate 3rd, assert callout triggered. Assert `next_escalation_at` not modified.
+**Behavior:**
+1. On each `verifyImage` rejection in an active run, write a `proof_attempt_rejected` event to `session_events`.
+2. `next_escalation_at` UNCHANGED.
+3. Counter check: `SELECT COUNT(*) FROM session_events WHERE run_id=? AND event_type='proof_attempt_rejected'`.
+4. If count ≥ 3, `UPDATE habit_runs SET proof_rejection_callout_due = 1 WHERE id=?`.
+5. No Discord dispatch from this task. The callout text is composed inside the next habit-checkin prompt builder (Task 24+) when it sees the flag set, and habit-checkin resets the flag after a successful dispatch.
 
-**Commit:** `feat(orchestrate): vision rejection counter with 3+ callout`
+**Test:**
+- Seed 2 prior rejection events, simulate 3rd → assert `proof_rejection_callout_due=1` set on habit_runs row.
+- Assert `next_escalation_at` not modified.
+- Assert no Discord adapter calls (the test should not require discord-adapter to be importable).
+- Seed run with 5 rejections but flag already true → assert no duplicate work (idempotent).
+
+**Commit:** `feat(orchestrate): vision rejection counter sets habit_runs flag (3+ threshold)`
 
 ---
 
@@ -547,18 +558,32 @@ Posts to `#wins` via `discord-adapter.postToChannel`.
 
 ## Tier 8 — habit-checkin core
 
-### Task 24: habit-checkin verb scaffold + L1 message
+### Task 24: habit-checkin verb scaffold + L1 message + shared prompt-builder
 
 **Files:**
 - Create: `src/orchestrate/habit-checkin.ts`
+- Create: `src/lib/prompt-builder.ts`  ← shared helper used by all level templates
 - Create: `src/lib/prompt-templates/level-1.ts`
 - Create: `tests/orchestrate/habit-checkin-l1.test.ts`
+- Create: `tests/lib/prompt-builder.test.ts`
 
 **Behavior:** verb invoked by scheduler with `{run_id, current_level: 1}`. Loads habit + run + recent events. Builds a Claude system prompt that includes habit name, time, proof_type, and the warm-friend voice rules. Dispatches `claude -p` with `--json-schema` requiring `{message_text, next_check_in_iso}`. Posts message to habit's channel. Updates `next_escalation_at` per habit's L1→L2 delta.
 
-**Test:** mock `dispatchClaude` to return canned output. Assert: structured output parsed, message posted to correct channel, `next_escalation_at` advanced by correct delta per habit (row +30m, wind-down +8m).
+**Shared prompt-builder responsibilities (used by Tasks 24, 25, 27, 28, 30, 31):**
+- Composes the system prompt from: voice rules for the level, habit context, run context, recent events.
+- **Reads `habit_runs.proof_rejection_callout_due`. If `true`, prepends to the prompt:** "The user has had 3+ photo proof attempts rejected this run. Call this out directly in your message: 'That's three photos that aren't the {proof_config.vision_subject}. What's going on?' Compose this naturally into the level's tone — at L1 it stays warm-friend ('Hey — three photos that weren't the {subject}, what's going on?'); at L4 it's direct."
+- **After habit-checkin successfully dispatches a message with the callout, `UPDATE habit_runs SET proof_rejection_callout_due = 0 WHERE id=?`.**
+- This means the callout fires exactly once per "third strike" — not on every subsequent message.
 
-**Commit:** `feat(orchestrate): habit-checkin verb with L1 message generation`
+**Test (Task 24):** mock `dispatchClaude` to return canned output. Assert: structured output parsed, message posted to correct channel, `next_escalation_at` advanced by correct delta per habit (row +30m, wind-down +8m).
+
+**Test (prompt-builder):**
+- Without flag → prompt does not contain callout instruction.
+- With flag → prompt contains callout instruction, vision_subject interpolated correctly.
+- After dispatch → flag reset to 0 in DB.
+- Idempotent: same run, same level, fired twice (e.g., retry) — second fire does not re-include callout because flag is now 0.
+
+**Commit:** `feat(orchestrate): habit-checkin verb with L1 message + shared prompt-builder reading rejection callout flag`
 
 ---
 
@@ -874,7 +899,7 @@ WantedBy=multi-user.target
 - [ ] `pnpm test` — all unit tests green
 - [ ] `pnpm test tests/soak/` — all soak tests green
 - [ ] systemd unit installed, daemon running, watchdog observable
-- [ ] One-week real-world soak run with all three habits firing daily
+- [ ] **14-day minimum** real-world soak run with all three habits firing daily. 14 days is a floor, not a ceiling — extend if soak criteria can't yet be observed (e.g., body_data_anomaly hasn't fired organically because compliance is high; in that case extend OR rely on Task 41's manual L3 trigger to satisfy falsifiability). Rationale: wind-down fires 5 nights/week (10 fires in 14 days, doubles statistical power vs 7-day), strength fires 3×/week (6 fires in 14 days), and real-world failure modes like Bluetooth flakes, MFA expiry, and DST-night bugs need room to surface.
 - [ ] Soak meets criteria from design doc §6:
   - daemon uptime > 99%
   - all scheduled fires dispatched
