@@ -11,8 +11,15 @@
     "gate": "pnpm typecheck && pnpm build && pnpm test"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20.11.0",
     "typescript": "^5.4.0",
     "vitest": "^1.4.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.10.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["better-sqlite3"]
   }
 }
