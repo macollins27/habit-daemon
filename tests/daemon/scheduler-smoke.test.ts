@@ -19,6 +19,24 @@ describe("scheduler tick", () => {
       next_run_iso      TEXT,
       dispatch_priority INTEGER NOT NULL DEFAULT 100
     );`);
+    // habit_runs table is also queried by schedulerTick (Task 32 added
+    // next_escalation_at polling). The smoke test only verifies the tick
+    // doesn't throw against empty tables — the shape here mirrors
+    // migration 001 (the FK to habits is omitted since habits isn't
+    // created here; SQLite doesn't enforce FKs without PRAGMA anyway).
+    db.exec(`CREATE TABLE habit_runs (
+      id                          TEXT PRIMARY KEY,
+      habit_id                    TEXT NOT NULL,
+      fire_date                   TEXT NOT NULL,
+      fired_at                    INTEGER NOT NULL,
+      current_level               INTEGER NOT NULL DEFAULT 1,
+      next_escalation_at          INTEGER,
+      status                      TEXT NOT NULL,
+      completed_at                INTEGER,
+      proof_payload_json          TEXT,
+      skip_reason                 TEXT,
+      proof_rejection_callout_due INTEGER NOT NULL DEFAULT 0
+    );`);
     await expect(schedulerTick({ db, dispatch: async () => {} })).resolves.not.toThrow();
   });
 });

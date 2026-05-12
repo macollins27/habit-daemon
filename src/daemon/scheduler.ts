@@ -190,14 +190,90 @@ async function tickOnce(db: Database.Database, dispatch: DispatchFn): Promise<vo
   }
 }
 
+interface DueHabitRunRow {
+  readonly id: string;
+  readonly habit_id: string;
+  readonly current_level: number;
+  readonly fired_at: number;
+}
+
+function listDueHabitRuns(
+  db: Database.Database,
+  nowMs: number,
+): readonly DueHabitRunRow[] {
+  return db
+    .prepare(
+      `SELECT id, habit_id, current_level, fired_at
+       FROM habit_runs
+       WHERE next_escalation_at IS NOT NULL
+         AND next_escalation_at <= ?
+         AND status = 'pending'
+       ORDER BY fired_at ASC`,
+    )
+    .all(nowMs) as DueHabitRunRow[];
+}
+
+/**
+ * Poll habit_runs for due escalations and dispatch `habit-checkin` for each.
+ *
+ * The scheduler is intentionally "fire only" here: it does NOT modify
+ * `current_level` or `next_escalation_at` after dispatch. The `habit-checkin`
+ * verb (Task 24+, wired in Task 39) owns those writes. Keeping the scheduler
+ * stateless w.r.t. escalation cadence means the verb is the single writer of
+ * run state — which is critical for atomicity around the "dispatch + level
+ * advance + event append" triple.
+ *
+ * Phase A simplification: rows are ordered by `fired_at ASC` (oldest first
+ * = fairness). `dispatch_priority` is a `schedules` column, not a
+ * `habit_runs` column; with only 3 Phase A habits, differential per-run
+ * priority is unnecessary. Phase B could add `habit_runs.dispatch_priority`
+ * if needed.
+ *
+ * A throwing dispatch is logged to stderr and does NOT halt the loop — the
+ * remaining due rows still get their turn. (The verb-level error handling
+ * inside `runHabitCheckin` is responsible for whether to retry, mark missed,
+ * etc.; the scheduler's only contract is "fire each due row at least once
+ * per tick.")
+ */
+async function tickHabitRunEscalations(
+  db: Database.Database,
+  dispatch: DispatchFn,
+  nowMs: number,
+): Promise<void> {
+  for (const row of listDueHabitRuns(db, nowMs)) {
+    const argsJson = JSON.stringify({
+      runId: row.id,
+      currentLevel: row.current_level,
+    });
+    try {
+      await dispatch("habit-checkin", argsJson);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      err(
+        `[scheduler] habit-checkin dispatch FAILED for run ${row.id}: ${msg.slice(0, 500)}`,
+      );
+    }
+  }
+}
+
 /**
  * Asynchronous tick — used by scheduler-daemon.ts which loops + sleeps.
- * Iterates enabled schedules in `(dispatch_priority ASC, id ASC)` order,
- * decides due-ness per row, and awaits the caller-supplied dispatch callback
- * for any firing row. A throwing/rejecting dispatch is treated as a failed
- * run; the row is disabled iff missed_run_policy='fail'.
+ *
+ * Runs two polling passes per tick, in order:
+ *   1. `schedules` table (cron-driven verb dispatch) — iterated in
+ *      `(dispatch_priority ASC, id ASC)` order. A throwing/rejecting dispatch
+ *      is treated as a failed run; the row is disabled iff
+ *      missed_run_policy='fail'.
+ *   2. `habit_runs.next_escalation_at` (escalation-driven `habit-checkin`
+ *      dispatch) — iterated in `fired_at ASC` order. The scheduler does NOT
+ *      mutate run state; the verb owns level / next_escalation_at writes.
+ *
+ * Schedules-first ordering means a midnight wins-poster always runs before
+ * habit-checkin pickups on the same tick, which matches the intent of the
+ * cron-driven daily ceremonies (R7 Autobeat lift, doc § 3).
  */
 export async function schedulerTick(opts: SchedulerOptions): Promise<void> {
   await tickOnce(opts.db, opts.dispatch);
+  await tickHabitRunEscalations(opts.db, opts.dispatch, Date.now());
   if (opts.onTick) opts.onTick();
 }
