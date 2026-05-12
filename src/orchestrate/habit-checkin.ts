@@ -50,6 +50,7 @@ import {
   type LevelTemplate,
 } from "../lib/prompt-builder.js";
 import { LEVEL_1_TEMPLATE } from "../lib/prompt-templates/level-1.js";
+import { LEVEL_2_TEMPLATE } from "../lib/prompt-templates/level-2.js";
 
 // -----------------------------------------------------------------------------
 // Per-habit escalation cadence (design § 3).
@@ -109,14 +110,14 @@ function channelForDomain(domain: string): ChannelName {
 }
 
 // -----------------------------------------------------------------------------
-// Output-schema validation. Mirrors the JSON Schema emitted by
-// LEVEL_1_TEMPLATE.outputSchema. Kept as a sibling Zod instead of imported
-// from level-1.ts because the level template exposes only the JSON Schema
-// string — the validator stays inside the verb so the verb owns the
-// post-dispatch parse contract.
+// Output-schema validation. Mirrors the JSON Schema emitted by every level
+// template (L1 + L2 share the same {message_text, next_check_in_iso} shape).
+// Kept as a sibling Zod instead of imported from the templates because each
+// template exposes only the JSON Schema string — the validator stays inside
+// the verb so the verb owns the post-dispatch parse contract.
 // -----------------------------------------------------------------------------
 
-const L1_OUTPUT_VALIDATION_SCHEMA = z.object({
+const CHECKIN_OUTPUT_VALIDATION_SCHEMA = z.object({
   message_text: z.string().min(1),
   next_check_in_iso: z.string(),
 });
@@ -219,9 +220,11 @@ function selectLevelTemplate(currentLevel: number): LevelTemplate {
   switch (currentLevel) {
     case 1:
       return LEVEL_1_TEMPLATE;
+    case 2:
+      return LEVEL_2_TEMPLATE;
     default:
       throw new Error(
-        `habit-checkin currentLevel=${currentLevel} is not supported in Task 24 (only L1 wired)`,
+        `habit-checkin currentLevel=${currentLevel} is not supported yet (L1 + L2 wired)`,
       );
   }
 }
@@ -368,9 +371,9 @@ export async function runHabitCheckin(
   }
 
   // ---------------------------------------------------------------------------
-  // 5. Validate the model's output against the L1 schema.
+  // 5. Validate the model's output against the shared check-in schema.
   // ---------------------------------------------------------------------------
-  const parsed = L1_OUTPUT_VALIDATION_SCHEMA.safeParse(
+  const parsed = CHECKIN_OUTPUT_VALIDATION_SCHEMA.safeParse(
     dispatchResult.structured_output,
   );
   if (!parsed.success) {

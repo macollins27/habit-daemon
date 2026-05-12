@@ -530,11 +530,11 @@ describe("runHabitCheckin() at L1", () => {
     expect(matches).toBe(true);
   });
 
-  it("unsupported currentLevel throws (L2 not implemented in Task 24)", async () => {
+  it("unsupported currentLevel throws (L3 not yet wired)", async () => {
     seedHabitRun(db, {
-      runId: "run-l2-rejected",
+      runId: "run-l3-rejected",
       habitId: "morning-row",
-      currentLevel: 2,
+      currentLevel: 3,
     });
     const { adapter } = buildAdapter();
     const { impl } = happyDispatch();
@@ -544,8 +544,8 @@ describe("runHabitCheckin() at L1", () => {
         sessionStore,
         adapter,
         sessionId: SESSION_ID,
-        runId: "run-l2-rejected",
-        currentLevel: 2,
+        runId: "run-l3-rejected",
+        currentLevel: 3,
         now: NOW_MS,
         dispatchImpl: impl,
       }),
