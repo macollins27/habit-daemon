@@ -1,6 +1,15 @@
 /**
  * Forked from Property-Linkware-v2.1/scripts/lib/orchestrator/scheduler.ts
  * at PLW commit v1 (26c8c049). Diverges from this point. Do not auto-sync.
+ *
+ * Habit-daemon adaptation (Task 4, 2026-05-12; divergence #2 — PLW fork
+ * adaptation at point of activation): the scheduler is now substrate-agnostic.
+ * Instead of owning a `Ledger` and a `bin/plw` subprocess spawner, it operates
+ * on a raw better-sqlite3 `Database` and delegates verb execution to a
+ * caller-supplied `dispatch` callback. This lets the daemon (which still
+ * spawns `bin/plw` during Phase A bootstrap) and tests (which inject a no-op
+ * dispatch) share one codepath. PLW's missed_run_policy semantics
+ * (skip/catchup/fail) and the cron → next_run_iso flow are preserved verbatim.
  */
 // scripts/lib/orchestrator/scheduler.ts
 //
@@ -18,9 +27,8 @@
 //   - docs/plans/master-orchestrator-design-v2.md §15 (v0.3 phased build)
 //   - R7 finding: 2026-05-02_agentmanager-autobeat-deep-dive.md (missed_run_policy)
 
-import { spawnSync } from "node:child_process";
-import { resolve } from "node:path";
-import { Ledger, type MissedRunPolicy } from "./ledger.js";
+import type Database from "better-sqlite3";
+import { type MissedRunPolicy } from "./ledger.js";
 import { nextRunFromString } from "./cron-parser.js";
 
 export interface ScheduleRow {
@@ -32,12 +40,19 @@ export interface ScheduleRow {
   readonly enabled: 0 | 1;
   readonly last_run_iso: string | null;
   readonly next_run_iso: string | null;
+  readonly dispatch_priority: number;
 }
 
+/**
+ * Caller-supplied verb dispatcher. Rejecting or throwing is treated as a
+ * dispatch failure (analogous to a non-zero exit code in the PLW
+ * spawn-based implementation).
+ */
+export type DispatchFn = (verb: string, argsJson: string) => Promise<void> | void;
+
 export interface SchedulerOptions {
-  readonly ledger: Ledger;
-  /** Path to bin/plw to invoke. Default: resolve from PROJECT_ROOT. */
-  readonly plwBin?: string;
+  readonly db: Database.Database;
+  readonly dispatch: DispatchFn;
   /** Function called every iteration AFTER a dispatch attempt (or when idle). */
   readonly onTick?: () => void;
   /** Seconds to sleep when no schedules are due. */
@@ -48,53 +63,33 @@ function err(line: string): void {
   process.stderr.write(line + "\n");
 }
 
-function listEnabledSchedules(ledger: Ledger): readonly ScheduleRow[] {
-  return ledger.sessionStore.db
+function listEnabledSchedules(db: Database.Database): readonly ScheduleRow[] {
+  return db
     .prepare(
       `SELECT id, cron_expr, verb, args_json, missed_run_policy, enabled,
-              last_run_iso, next_run_iso
+              last_run_iso, next_run_iso, dispatch_priority
        FROM schedules
        WHERE enabled = 1
-       ORDER BY id ASC`,
+       ORDER BY dispatch_priority ASC, id ASC`,
     )
     .all() as ScheduleRow[];
 }
 
 function updateScheduleAfterRun(
-  ledger: Ledger,
+  db: Database.Database,
   scheduleId: number,
   ranAtIso: string,
   nextRunIso: string | null,
 ): void {
-  ledger.sessionStore.db
-    .prepare(`UPDATE schedules SET last_run_iso = ?, next_run_iso = ? WHERE id = ?`)
-    .run(ranAtIso, nextRunIso, scheduleId);
+  db.prepare(`UPDATE schedules SET last_run_iso = ?, next_run_iso = ? WHERE id = ?`).run(
+    ranAtIso,
+    nextRunIso,
+    scheduleId,
+  );
 }
 
-function disableSchedule(ledger: Ledger, scheduleId: number): void {
-  ledger.sessionStore.db.prepare(`UPDATE schedules SET enabled = 0 WHERE id = ?`).run(scheduleId);
-}
-
-function dispatchVerb(
-  plwBin: string,
-  verb: string,
-  argsJson: string,
-): { exitCode: number; stderr: string } {
-  let args: readonly string[];
-  try {
-    const parsed = JSON.parse(argsJson) as unknown;
-    args = Array.isArray(parsed) ? parsed.filter((a): a is string => typeof a === "string") : [];
-  } catch {
-    args = [];
-  }
-  const result = spawnSync("/usr/bin/env", [plwBin, verb, ...args], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  return {
-    exitCode: result.status ?? -1,
-    stderr: result.stderr ?? "",
-  };
+function disableSchedule(db: Database.Database, scheduleId: number): void {
+  db.prepare(`UPDATE schedules SET enabled = 0 WHERE id = ?`).run(scheduleId);
 }
 
 interface DueDecision {
@@ -158,67 +153,67 @@ function decideDueness(row: ScheduleRow, now: Date): DueDecision {
   };
 }
 
-function decideOrDisable(ledger: Ledger, row: ScheduleRow, now: Date): DueDecision | null {
+function decideOrDisable(db: Database.Database, row: ScheduleRow, now: Date): DueDecision | null {
   try {
     return decideDueness(row, now);
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     err(`[scheduler] schedule #${String(row.id)}: parse error "${msg}". Disabling.`);
-    disableSchedule(ledger, row.id);
+    disableSchedule(db, row.id);
     return null;
   }
 }
 
-function reportDispatchFailure(
-  ledger: Ledger,
-  row: ScheduleRow,
-  exitCode: number,
-  stderr: string,
-): void {
-  err(`[scheduler] schedule #${String(row.id)} dispatch FAILED: exit ${String(exitCode)}`);
-  err(`[scheduler] stderr: ${stderr.slice(0, 500)}`);
+function reportDispatchFailure(db: Database.Database, row: ScheduleRow, error: unknown): void {
+  const msg = error instanceof Error ? error.message : String(error);
+  err(`[scheduler] schedule #${String(row.id)} dispatch FAILED: ${msg.slice(0, 500)}`);
   if (row.missed_run_policy === "fail") {
     err(`[scheduler] policy=fail; disabling schedule.`);
-    disableSchedule(ledger, row.id);
+    disableSchedule(db, row.id);
   }
 }
 
-function tickOneSchedule(ledger: Ledger, plwBin: string, row: ScheduleRow, now: Date): void {
-  const decision = decideOrDisable(ledger, row, now);
+async function tickOneSchedule(
+  db: Database.Database,
+  dispatch: DispatchFn,
+  row: ScheduleRow,
+  now: Date,
+): Promise<void> {
+  const decision = decideOrDisable(db, row, now);
   if (decision === null) return;
 
   if (!decision.fire) {
     if (decision.nextScheduledIso !== row.next_run_iso) {
-      updateScheduleAfterRun(ledger, row.id, row.last_run_iso ?? "", decision.nextScheduledIso);
+      updateScheduleAfterRun(db, row.id, row.last_run_iso ?? "", decision.nextScheduledIso);
     }
     return;
   }
 
   err(`[scheduler] firing schedule #${String(row.id)}: ${row.verb} (reason: ${decision.reason})`);
-  const result = dispatchVerb(plwBin, row.verb, row.args_json);
-  if (result.exitCode !== 0) {
-    reportDispatchFailure(ledger, row, result.exitCode, result.stderr);
+  try {
+    await dispatch(row.verb, row.args_json);
+  } catch (e: unknown) {
+    reportDispatchFailure(db, row, e);
     if (row.missed_run_policy === "fail") return;
   }
-  updateScheduleAfterRun(ledger, row.id, now.toISOString(), decision.nextScheduledIso);
+  updateScheduleAfterRun(db, row.id, now.toISOString(), decision.nextScheduledIso);
 }
 
-function tickOnce(ledger: Ledger, plwBin: string): void {
+async function tickOnce(db: Database.Database, dispatch: DispatchFn): Promise<void> {
   const now = new Date();
-  for (const row of listEnabledSchedules(ledger)) {
-    tickOneSchedule(ledger, plwBin, row, now);
+  for (const row of listEnabledSchedules(db)) {
+    await tickOneSchedule(db, dispatch, row, now);
   }
-}
-
-export function defaultPlwBin(): string {
-  return resolve(process.env.PROJECT_ROOT ?? process.cwd(), "bin/plw");
 }
 
 /**
- * Synchronous tick — used by scheduler-daemon.ts which loops + sleeps.
+ * Asynchronous tick — used by scheduler-daemon.ts which loops + sleeps.
+ * Iterates enabled schedules in `(dispatch_priority ASC, id ASC)` order,
+ * decides due-ness per row, and awaits the caller-supplied dispatch callback
+ * for any firing row. A throwing/rejecting dispatch is treated as a failed
+ * run; the row is disabled iff missed_run_policy='fail'.
  */
-export function schedulerTick(opts: SchedulerOptions): void {
-  const plwBin = opts.plwBin ?? defaultPlwBin();
-  tickOnce(opts.ledger, plwBin);
+export async function schedulerTick(opts: SchedulerOptions): Promise<void> {
+  await tickOnce(opts.db, opts.dispatch);
   if (opts.onTick) opts.onTick();
 }
