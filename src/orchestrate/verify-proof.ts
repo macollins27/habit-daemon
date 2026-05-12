@@ -425,3 +425,74 @@ export function makeVerifyConcept2OrPhoto(
     };
   };
 }
+
+// -----------------------------------------------------------------------------
+// Task 35: verifyTrainingLogPhoto sub-verb.
+// -----------------------------------------------------------------------------
+//
+// Sub-verb for `proof_type = training_log_photo` (strength-mwf).
+//
+// Flow (design § 4):
+//   1. If `ctx.message` carries no image attachment → pending (no claim
+//      made; caller does NOT bump vision_rejection_count or flip status).
+//   2. If an image attachment is present → dispatch
+//      `verifyImage(subject='training_log')` against the first image.
+//      - Vision pass (is_training_log=true, entries_visible >= 3,
+//        confidence >= 0.7) → completed (source='photo', parsed payload).
+//      - Vision fail → rejected with the registry's threshold reason.
+//
+// Consistent with Task 34: this sub-verb performs NO `habit_runs.status`
+// writes and NO `recordVisionRejection` calls. The caller (production
+// wire-up in Task 39+) translates the VerifyProofResult into the actual
+// DB transition and counter bump.
+//
+// The training_log thresholds (entries >= 3, confidence >= 0.7) live in
+// `src/lib/vision-registry.ts` and are applied by `verifyImage` itself;
+// this sub-verb only translates `passed`/`reason`/`parsed` into the
+// VerifyProofResult envelope.
+
+export interface VerifyTrainingLogPhotoDeps {
+  /** Test seam for vision dispatch. Production falls through to the real chain. */
+  readonly visionDispatchImpl?: (opts: {
+    prompt: string;
+    jsonSchema: string;
+  }) => Promise<VisionDispatchResult>;
+}
+
+/**
+ * Factory for the training-log-photo sub-verb. The returned SubVerb closes
+ * over the vision dispatch impl so the caller can hand the same configured
+ * verb instance to the router across many invocations.
+ */
+export function makeVerifyTrainingLogPhoto(
+  deps: VerifyTrainingLogPhotoDeps,
+): SubVerb {
+  return async function verifyTrainingLogPhoto(
+    ctx: SubVerbContext,
+  ): Promise<VerifyProofResult> {
+    // 1. Pending if no image attachment is present (or attachment is non-image).
+    const image = findImageAttachment(ctx.message);
+    if (image === undefined) {
+      return { outcome: "pending" };
+    }
+
+    // 2. Dispatch vision verification of the attached image.
+    const visionResult = await verifyImage({
+      imageUrl: image.url,
+      subject: "training_log",
+      dispatchImpl: deps.visionDispatchImpl,
+    });
+
+    if (visionResult.passed) {
+      return {
+        outcome: "completed",
+        proofPayload: { source: "photo", parsed: visionResult.parsed },
+      };
+    }
+    return {
+      outcome: "rejected",
+      reason: visionResult.reason,
+      proofPayload: { source: "photo", parsed: visionResult.parsed },
+    };
+  };
+}
