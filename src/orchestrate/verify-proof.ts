@@ -37,6 +37,11 @@ import {
   type Concept2Tokens,
 } from "../lib/concept2-adapter.js";
 import {
+  postToChannel,
+  type DiscordAdapter,
+  type PostResult,
+} from "../lib/discord-adapter.js";
+import {
   verifyImage,
   type DispatchResult as VisionDispatchResult,
 } from "../lib/vision-verify.js";
@@ -494,5 +499,203 @@ export function makeVerifyTrainingLogPhoto(
       reason: visionResult.reason,
       proofPayload: { source: "photo", parsed: visionResult.parsed },
     };
+  };
+}
+
+// -----------------------------------------------------------------------------
+// Task 36: verifyWindDownStageA sub-verb.
+// -----------------------------------------------------------------------------
+//
+// Sub-verb for `proof_type = typed_msg+garmin_sleep` (wind-down). Stage A
+// handles the typed-message half of the two-stage proof. Stage B (Garmin
+// sleep onset) is a separate sub-verb owned by Task 37.
+//
+// Asymmetry vs Tasks 34/35 (IMPORTANT): the concept2 and training-log
+// sub-verbs return a `VerifyProofResult` envelope WITHOUT writing to the
+// DB or posting to Discord — the caller translates the outcome into a
+// status transition and (if completed) a #wins post. Task 36 is different:
+// per design § 4, stage A satisfaction TRIGGERS the partial transition,
+// the proof_stages row, and the Discord ack inline. Those side effects ARE
+// the stage-A handling, not a separable downstream policy. So this
+// sub-verb writes DB state AND posts to Discord on the happy path.
+//
+// Flow (design § 4 and Task 36 contract):
+//
+//   1. Load habit's `proof_config_json` for `stage_a_phrase` and
+//      `stage_a_window_min`. Load run's `fired_at`.
+//   2. Phrase match: lowercase the message content and check
+//      `stage_a_phrase` as a case-insensitive substring. Phase A's "fuzzy
+//      match" is intentionally simple — Phase B can replace this with a
+//      classifier without changing the sub-verb's outer contract.
+//   3. Window check: `(now - fired_at) / 60_000 <= stage_a_window_min`.
+//   4. If both checks pass:
+//        a. In a single DB transaction: INSERT OR REPLACE a proof_stages
+//           row keyed on a deterministic id (`proof-{runId}-a`) so that
+//           re-firing (e.g. user repeats the phrase) is idempotent; then
+//           UPDATE habit_runs SET status='partial', next_escalation_at=NULL.
+//        b. Post the fixed ack to #wind-down: "Got it. Garmin will tell us
+//           the rest." (verbatim from design § 4).
+//        c. Return outcome='partial' with a proofPayload describing the
+//           stage.
+//   5. If phrase matches but window has closed: outcome='pending' with a
+//      reason mentioning the window. No DB or Discord side effects.
+//   6. If phrase doesn't match (or empty content): outcome='pending'. No
+//      DB or Discord side effects.
+//
+// Post-failure semantics: the Discord post happens AFTER the DB
+// transaction commits. If `postImpl` throws, the DB state is left in its
+// new ('partial') state — rolling back would create a worse failure mode
+// (user typed the phrase, escalation cleared, but next L4 still fires
+// because we "un-stored" the stage). The error is logged via
+// `console.error` and the sub-verb still returns outcome='partial' so the
+// caller can record the result honestly.
+
+interface ProofConfigWindDown {
+  readonly stage_a_phrase: string;
+  readonly stage_a_window_min: number;
+}
+
+interface HabitRunFiredAtRow {
+  readonly fired_at: number;
+}
+
+function loadWindDownProofConfig(
+  db: Database.Database,
+  habitId: string,
+): ProofConfigWindDown {
+  const row = db
+    .prepare("SELECT proof_config_json FROM habits WHERE id = ?")
+    .get(habitId) as HabitConfigRow | undefined;
+  if (row === undefined) {
+    throw new Error(`habit not found: ${habitId}`);
+  }
+  const parsed = JSON.parse(row.proof_config_json) as Record<string, unknown>;
+  const phrase = parsed.stage_a_phrase;
+  const windowMin = parsed.stage_a_window_min;
+  if (typeof phrase !== "string" || typeof windowMin !== "number") {
+    throw new Error(
+      `habit ${habitId} proof_config_json malformed (expected stage_a_phrase: string, stage_a_window_min: number)`,
+    );
+  }
+  return { stage_a_phrase: phrase, stage_a_window_min: windowMin };
+}
+
+function loadRunFiredAt(db: Database.Database, runId: string): number {
+  const row = db
+    .prepare("SELECT fired_at FROM habit_runs WHERE id = ?")
+    .get(runId) as HabitRunFiredAtRow | undefined;
+  if (row === undefined) {
+    throw new Error(`habit_run not found: ${runId}`);
+  }
+  return row.fired_at;
+}
+
+/**
+ * Default post implementation — production callers leave `postImpl`
+ * unset and get the real `postToChannel`. Mirrored after habit-checkin's
+ * defaultPostImpl pattern for consistency.
+ */
+async function defaultStageAPost(opts: {
+  adapter: DiscordAdapter;
+  channel: "wind-down";
+  content: string;
+}): Promise<PostResult> {
+  return postToChannel({
+    adapter: opts.adapter,
+    channel: opts.channel,
+    content: opts.content,
+  });
+}
+
+export interface VerifyWindDownStageADeps {
+  readonly adapter: DiscordAdapter;
+  /** Test seam. Production callers leave this unset. */
+  readonly postImpl?: (opts: {
+    adapter: DiscordAdapter;
+    channel: "wind-down";
+    content: string;
+  }) => Promise<PostResult>;
+}
+
+/** Verbatim ack text from design § 4. */
+const STAGE_A_ACK_TEXT = "Got it. Garmin will tell us the rest.";
+
+/**
+ * Factory for the wind-down stage-A sub-verb. The returned SubVerb closes
+ * over the Discord adapter and the optional post implementation so the
+ * router can hand the same configured verb instance to every invocation.
+ */
+export function makeVerifyWindDownStageA(
+  deps: VerifyWindDownStageADeps,
+): SubVerb {
+  const postImpl = deps.postImpl ?? defaultStageAPost;
+
+  return async function verifyWindDownStageA(
+    ctx: SubVerbContext,
+  ): Promise<VerifyProofResult> {
+    const db = ctx.sessionStore.db;
+
+    // 1. Load config + run timing.
+    const config = loadWindDownProofConfig(db, ctx.habitId);
+    const firedAt = loadRunFiredAt(db, ctx.runId);
+
+    // 2. Phrase match (case-insensitive substring). Empty content can never
+    //    contain a non-empty phrase, so it falls through to pending.
+    const messageText = ctx.message.content ?? "";
+    const phraseMatches = messageText
+      .toLowerCase()
+      .includes(config.stage_a_phrase.toLowerCase());
+    if (!phraseMatches) {
+      return { outcome: "pending" };
+    }
+
+    // 3. Window check. `windowMin` is minutes; arithmetic is in ms.
+    const elapsedMin = (ctx.now - firedAt) / 60_000;
+    if (elapsedMin > config.stage_a_window_min) {
+      return { outcome: "pending", reason: "stage A window closed" };
+    }
+
+    // 4. Persist stage-A satisfaction + transition the run to 'partial' in
+    //    a single transaction. The id is deterministic so repeat invocations
+    //    (e.g. user types the phrase twice) idempotently refresh the row.
+    const stageId = `proof-${ctx.runId}-a`;
+    const proofData = {
+      stage: "a" as const,
+      satisfied_at: ctx.now,
+      message_text: messageText,
+    };
+    db.transaction(() => {
+      db.prepare(
+        `INSERT OR REPLACE INTO proof_stages (
+           id, run_id, stage, satisfied, satisfied_at, data_json
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(stageId, ctx.runId, "a", 1, ctx.now, JSON.stringify(proofData));
+
+      db.prepare(
+        `UPDATE habit_runs
+            SET status = 'partial',
+                next_escalation_at = NULL
+          WHERE id = ?`,
+      ).run(ctx.runId);
+    })();
+
+    // 5. Post the fixed ack. If posting fails, log to stderr but DO NOT
+    //    roll back the DB transaction — the user has satisfied stage A
+    //    and the escalation has been cleared; an ack failure is a UX
+    //    regression, not a correctness one.
+    try {
+      await postImpl({
+        adapter: deps.adapter,
+        channel: "wind-down",
+        content: STAGE_A_ACK_TEXT,
+      });
+    } catch (err: unknown) {
+      console.error(
+        `[verify-proof:wind-down] stage A ack post failed for run ${ctx.runId}`,
+        err,
+      );
+    }
+
+    return { outcome: "partial", proofPayload: proofData };
   };
 }
