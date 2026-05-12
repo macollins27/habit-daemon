@@ -25,7 +25,12 @@
 // discord.js Client (which opens timers, sets up a REST manager, etc.).
 // Production code passes nothing and gets the real `new Client(opts)`.
 
-import { Client, GatewayIntentBits, type ClientOptions } from "discord.js";
+import {
+  AttachmentBuilder,
+  Client,
+  GatewayIntentBits,
+  type ClientOptions,
+} from "discord.js";
 
 export type ChannelName =
   | "morning-row"
@@ -138,5 +143,112 @@ export function loadDiscordChannelIdsFromEnv(
     "wind-down": readRequiredEnv(env, ENV_VAR_BY_CHANNEL["wind-down"]),
     wins: readRequiredEnv(env, ENV_VAR_BY_CHANNEL.wins),
     "sunday-review": readRequiredEnv(env, ENV_VAR_BY_CHANNEL["sunday-review"]),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Task 21: outbound poster.
+//
+// `postToChannel` is the single outbound write path for the daemon. Every
+// scheduled habit prompt, win celebration, and Sunday review goes through
+// this verb so that:
+//
+//   - Channel resolution is centralized (no caller hand-holds a snowflake ID).
+//   - Attachments use a domain-shaped `AttachmentSpec` (Buffer + name +
+//     optional description) rather than discord.js types leaking into
+//     orchestration code.
+//   - The runtime guards (unknown channel name, fetch returns null, fetched
+//     channel is not text-based) all fail loud — there is no silent drop.
+//
+// `channel.send` rejections (rate limits, network errors, message-too-long)
+// propagate to the caller; retry/back-off policy lives at the orchestrator
+// layer where it has access to the habit run row and can decide whether to
+// reschedule or surface the failure.
+//
+// Note on empty messages: discord.js rejects `send({content: "", files: []})`
+// — `postToChannel` does not pre-validate that, because the only realistic
+// caller path always supplies either content or attachments. If a future
+// caller needs the guard, add it at that caller, not here.
+// ---------------------------------------------------------------------------
+
+export interface AttachmentSpec {
+  readonly name: string;
+  readonly data: Buffer;
+  readonly description?: string;
+}
+
+export interface PostToChannelOptions {
+  readonly adapter: DiscordAdapter;
+  readonly channel: ChannelName;
+  readonly content: string;
+  readonly attachments?: readonly AttachmentSpec[];
+}
+
+export interface PostResult {
+  readonly messageId: string;
+  readonly channelId: string;
+  readonly postedAt: number;
+}
+
+// Narrow shape we actually rely on from a discord.js TextBasedChannel. We
+// intentionally avoid importing the full discord.js channel union because
+// `channels.fetch` returns a wide `Channel | null` that requires the
+// `isTextBased()` narrowing to call `.send`.
+interface TextChannelLike {
+  readonly isTextBased: () => boolean;
+  readonly send: (payload: {
+    readonly content: string;
+    readonly files: readonly AttachmentBuilder[];
+  }) => Promise<{ readonly id: string }>;
+}
+
+function isChannelNameKnown(
+  channelIds: DiscordChannelIds,
+  name: string,
+): name is ChannelName {
+  return Object.prototype.hasOwnProperty.call(channelIds, name);
+}
+
+export async function postToChannel(
+  opts: PostToChannelOptions,
+): Promise<PostResult> {
+  const { adapter, channel, content, attachments } = opts;
+
+  // Runtime guard mirroring the compile-time `ChannelName` union: callers
+  // that bypass typing (e.g. dynamic dispatch with a string from config)
+  // still get a loud failure instead of a silent post to the wrong place.
+  if (!isChannelNameKnown(adapter.channelIds, channel)) {
+    throw new Error(`Unknown Discord channel name: "${channel}"`);
+  }
+
+  const channelId = adapter.channelIds[channel];
+
+  const fetched = await adapter.client.channels.fetch(channelId);
+  if (fetched === null) {
+    throw new Error(
+      `Discord channel "${channel}" (id=${channelId}) not found`,
+    );
+  }
+
+  const maybeText = fetched as unknown as TextChannelLike;
+  if (typeof maybeText.isTextBased !== "function" || !maybeText.isTextBased()) {
+    throw new Error(
+      `Discord channel "${channel}" (id=${channelId}) is not a text-based channel`,
+    );
+  }
+
+  const files: readonly AttachmentBuilder[] = (attachments ?? []).map((spec) =>
+    new AttachmentBuilder(spec.data, {
+      name: spec.name,
+      description: spec.description,
+    }),
+  );
+
+  const message = await maybeText.send({ content, files });
+
+  return {
+    messageId: message.id,
+    channelId,
+    postedAt: Date.now(),
   };
 }
