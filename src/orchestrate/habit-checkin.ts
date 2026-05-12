@@ -54,6 +54,7 @@ import { LEVEL_2_TEMPLATE } from "../lib/prompt-templates/level-2.js";
 import { buildL3StakesTemplate } from "../lib/prompt-templates/level-3-stakes.js";
 import { buildL3BodyDataTemplate } from "../lib/prompt-templates/level-3-body-data.js";
 import { buildL3PatternTemplate } from "../lib/prompt-templates/level-3-pattern.js";
+import { LEVEL_4_TEMPLATE } from "../lib/prompt-templates/level-4.js";
 import {
   selectWell,
   type MissReason,
@@ -254,9 +255,11 @@ function selectLevelTemplate(
         `habit-checkin L3 unsupported well selection: ${JSON.stringify(opts.wellSelection)}`,
       );
     }
+    case 4:
+      return LEVEL_4_TEMPLATE;
     default:
       throw new Error(
-        `habit-checkin currentLevel=${currentLevel} is not supported yet (L1-L3 wired)`,
+        `habit-checkin currentLevel=${currentLevel} is not supported yet (L1-L4 wired)`,
       );
   }
 }
