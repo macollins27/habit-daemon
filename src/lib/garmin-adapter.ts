@@ -30,6 +30,7 @@ import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type Database from "better-sqlite3";
 
 export interface GarminSleep {
   readonly sleep_onset_time: string | null;
@@ -243,4 +244,57 @@ export async function fetchSleep(
   }
 
   return projectSleep(obj);
+}
+
+// Task 14: cache one day's Garmin sleep into the sensor_signals table.
+//
+// The daemon polls Garmin on a recurring schedule (Task 16 wires it up).
+// Each poll fetches that day's sleep and persists it as a single
+// sensor_signals row keyed by (source='garmin', payload_date=YYYY-MM-DD).
+// The deterministic id `garmin-YYYY-MM-DD` makes the row idempotently
+// queryable from feature builders without a secondary index.
+//
+// The payload is wrapped as `{sleep: ...}` rather than the bare GarminSleep
+// object so future Garmin signals (steps, body_battery, stress) can be added
+// as sibling keys without breaking parsers that already read `sleep`.
+//
+// When fetchSleep returns null (Garmin successfully responded with no data
+// for the date), we still write a row with `payload_json = {"sleep":null}`.
+// This preserves the "we successfully queried and got nothing" signal that
+// downstream resolvers need to distinguish from "we never asked" (no row).
+//
+// Errors from fetchSleep (GarminAuthExpired / GarminNetworkError /
+// GarminBridgeError) propagate untouched. Task 15 will handle the
+// unresolved-status orchestration on the caller side.
+export interface SyncDateOptions {
+  readonly db: Database.Database;
+  readonly date: string;
+  readonly pythonBin?: string;
+  readonly scriptPath?: string;
+  readonly stub?: boolean;
+  readonly fields?: readonly string[];
+  readonly spawnImpl?: SpawnImpl;
+}
+
+export async function syncDate(opts: SyncDateOptions): Promise<void> {
+  const sleep = await fetchSleep({
+    date: opts.date,
+    pythonBin: opts.pythonBin,
+    scriptPath: opts.scriptPath,
+    stub: opts.stub,
+    fields: opts.fields,
+    spawnImpl: opts.spawnImpl,
+  });
+
+  const id = `garmin-${opts.date}`;
+  const payloadJson = JSON.stringify({ sleep });
+  const fetchedAt = Date.now();
+
+  opts.db
+    .prepare(
+      `INSERT OR REPLACE INTO sensor_signals (
+        id, source, payload_date, payload_json, fetched_at
+      ) VALUES (?, 'garmin', ?, ?, ?)`,
+    )
+    .run(id, opts.date, payloadJson, fetchedAt);
 }
