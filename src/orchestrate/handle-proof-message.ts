@@ -1,0 +1,293 @@
+/**
+ * handle-proof-message — wires the Discord listener to the verify-proof
+ * routing + the downstream state transitions.
+ *
+ * The Discord listener (Task 22 `subscribeMessages`) calls this handler when
+ * an incoming message matches an active habit_run. The handler:
+ *   1. Routes the message through verify-proof (Task 33's `verifyProof`).
+ *   2. Translates the sub-verb's outcome into DB writes + side effects:
+ *      - 'completed': UPDATE habit_runs.status='completed', completed_at=now,
+ *                     next_escalation_at=NULL. Post to #wins via wins-poster.
+ *      - 'partial':   wind-down stage A already wrote the state transition
+ *                     inline (it's the asymmetric verb from Task 36). Handler
+ *                     is a no-op for this outcome.
+ *      - 'rejected':  call recordVisionRejection (Task 19) to log the event
+ *                     + maybe flip the proof_rejection_callout_due flag.
+ *      - 'pending':   no-op (no claim was made; verifier waits for proof).
+ *
+ * The verify-proof router takes injected sub-verbs. This handler constructs
+ * them with the runtime deps the bootstrap holds (concept2 creds/tokens,
+ * vision dispatch impl).
+ */
+
+import type { Message } from "discord.js";
+import type { SessionStore } from "../daemon/session-store.js";
+import type {
+  ChannelName,
+  DiscordAdapter,
+} from "../lib/discord-adapter.js";
+import type {
+  Concept2Credentials,
+  Concept2Tokens,
+} from "../lib/concept2-adapter.js";
+import type { ActiveHabitRun } from "../lib/discord-adapter.js";
+
+import {
+  verifyProof,
+  makeVerifyConcept2OrPhoto,
+  makeVerifyTrainingLogPhoto,
+  makeVerifyWindDownStageA,
+} from "./verify-proof.js";
+import { postWin, type Completion } from "./wins-poster.js";
+import { recordVisionRejection } from "./vision-rejection-counter.js";
+import type { VisionRejection } from "./vision-rejection-counter.js";
+
+export interface HandleProofMessageOptions {
+  readonly sessionStore: SessionStore;
+  readonly adapter: DiscordAdapter;
+  readonly sessionId: string;
+  readonly run: ActiveHabitRun;
+  readonly message: Message;
+  readonly channelName: ChannelName;
+  readonly now: number;
+  readonly concept2: {
+    readonly credentials: Concept2Credentials;
+    readonly tokens: Concept2Tokens;
+    readonly onTokensRefreshed: (newTokens: Concept2Tokens) => void;
+  } | null;
+  readonly visionDispatchImpl: (opts: {
+    prompt: string;
+    jsonSchema: string;
+  }) => Promise<{ structured_output?: unknown; error?: string }>;
+}
+
+interface HabitRowForProof {
+  readonly id: string;
+}
+
+interface RunCompletionData {
+  readonly run_id: string;
+  readonly fired_at: number;
+}
+
+interface ParsedConcept2 {
+  readonly date?: string;
+  readonly duration_seconds?: number;
+  readonly distance_meters?: number;
+}
+
+interface StageAProofRow {
+  readonly satisfied_at: number | null;
+}
+
+/**
+ * Translate a verify-proof outcome into the downstream state transition for
+ * the matched run. Idempotent on re-invocations within the same proof attempt.
+ */
+export async function handleProofMessage(
+  opts: HandleProofMessageOptions,
+): Promise<void> {
+  const db = opts.sessionStore.db;
+
+  // Skip if the run is already terminal — defensive against late-arriving
+  // messages.
+  if (opts.run.status !== "pending" && opts.run.status !== "partial") {
+    return;
+  }
+
+  // Build sub-verbs with the runtime deps the handler holds.
+  const verifyConcept2 = opts.concept2
+    ? makeVerifyConcept2OrPhoto({
+        credentials: opts.concept2.credentials,
+        tokens: opts.concept2.tokens,
+        onTokensRefreshed: opts.concept2.onTokensRefreshed,
+        visionDispatchImpl: opts.visionDispatchImpl,
+      })
+    : undefined;
+  const verifyTrainingLog = makeVerifyTrainingLogPhoto({
+    visionDispatchImpl: opts.visionDispatchImpl,
+  });
+  const verifyWindDown = makeVerifyWindDownStageA({
+    adapter: opts.adapter,
+  });
+
+  const result = await verifyProof({
+    db,
+    sessionStore: opts.sessionStore,
+    sessionId: opts.sessionId,
+    habitId: opts.run.habit_id,
+    runId: opts.run.id,
+    message: opts.message,
+    now: opts.now,
+    subVerbs: {
+      verifyConcept2OrPhoto: verifyConcept2,
+      verifyTrainingLogPhoto: verifyTrainingLog,
+      verifyWindDownStageA: verifyWindDown,
+    },
+  });
+
+  switch (result.outcome) {
+    case "completed": {
+      await applyCompleted(opts, result.proofPayload);
+      return;
+    }
+    case "partial": {
+      // Wind-down stage A already wrote the DB transition + posted the ack
+      // inline (Task 36). No further action needed here.
+      return;
+    }
+    case "rejected": {
+      applyRejected(opts, result.proofPayload, result.reason);
+      return;
+    }
+    case "pending":
+    default: {
+      // No claim was made (no attachment / phrase mismatch / etc.). Wait.
+      return;
+    }
+  }
+}
+
+async function applyCompleted(
+  opts: HandleProofMessageOptions,
+  proofPayload: unknown,
+): Promise<void> {
+  const db = opts.sessionStore.db;
+  const sessionStore = opts.sessionStore;
+
+  // UPDATE habit_runs + append session_event in a single tx.
+  const writeTx = db.transaction((payloadJson: string): void => {
+    db.prepare(
+      `UPDATE habit_runs
+       SET status = 'completed', completed_at = ?, next_escalation_at = NULL, proof_payload_json = ?
+       WHERE id = ?`,
+    ).run(opts.now, payloadJson, opts.run.id);
+
+    sessionStore.append(
+      opts.sessionId,
+      "habit_completed",
+      {
+        habitId: opts.run.habit_id,
+        runId: opts.run.id,
+        completedAt: opts.now,
+        proofPayload,
+      },
+      { trustLevel: "L1" },
+    );
+  });
+  writeTx(JSON.stringify({ proof: proofPayload }));
+
+  // Post to #wins. Format depends on habit domain.
+  const completion = buildCompletionForHabit(opts.run.habit_id, proofPayload, opts);
+  if (completion !== null) {
+    await postWin({
+      adapter: opts.adapter,
+      status: "completed",
+      completion,
+    });
+  }
+}
+
+function applyRejected(
+  opts: HandleProofMessageOptions,
+  proofPayload: unknown,
+  reason: string | undefined,
+): void {
+  const subject = subjectForHabit(opts.run.habit_id);
+  const rejection: VisionRejection = {
+    subject,
+    reason: reason ?? "rejected by verifier",
+    parsed: proofPayload,
+  };
+  recordVisionRejection({
+    sessionStore: opts.sessionStore,
+    sessionId: opts.sessionId,
+    runId: opts.run.id,
+    rejection,
+  });
+}
+
+/**
+ * Map habit id to the vision-registry subject used for proof-rejection audit
+ * trails. Only habits with a photo-proof path appear here.
+ */
+function subjectForHabit(habitId: string): string {
+  switch (habitId) {
+    case "morning-row":
+      return "pm5_screen";
+    case "strength-mwf":
+      return "training_log";
+    default:
+      return habitId;
+  }
+}
+
+function buildCompletionForHabit(
+  habitId: string,
+  proofPayload: unknown,
+  opts: HandleProofMessageOptions,
+): Completion | null {
+  switch (habitId) {
+    case "morning-row":
+      return buildRowCompletion(proofPayload, opts);
+    case "strength-mwf":
+      return buildStrengthCompletion(opts);
+    case "wind-down":
+      // wind-down's #wins post is fired by evaluate-stage-b (Task 37), not
+      // by the proof-message handler. Stage A satisfaction here only sets
+      // status='partial'; the completed transition happens the next morning
+      // when stage B resolves.
+      return null;
+    default:
+      return null;
+  }
+}
+
+function buildRowCompletion(
+  proofPayload: unknown,
+  opts: HandleProofMessageOptions,
+): Completion {
+  // Try to extract Concept2 session data for the rich format
+  // "✓ Morning row · 9:42 · 12 min · 2,143m". Fall back to the message time
+  // + minimal data if the payload doesn't have it (e.g., photo-fallback path).
+  const payload = (proofPayload ?? {}) as {
+    source?: string;
+    session?: ParsedConcept2;
+  };
+  const session = payload.session;
+  const time = formatTimeHHMM(new Date(opts.now));
+  const durationMinutes =
+    session?.duration_seconds !== undefined
+      ? Math.round(session.duration_seconds / 60)
+      : 0;
+  const meters = session?.distance_meters ?? 0;
+  return {
+    habit: "morning-row",
+    time,
+    durationMinutes,
+    meters,
+  };
+}
+
+function buildStrengthCompletion(opts: HandleProofMessageOptions): Completion {
+  return {
+    habit: "strength-mwf",
+    time: formatStrengthTime(new Date(opts.now)),
+    liftCount: 0, // Vision payload's entries_visible isn't surfaced here;
+    // future task can plumb it through. Phase A acceptable: post fires.
+  };
+}
+
+function formatTimeHHMM(d: Date): string {
+  const h = d.getHours();
+  const m = String(d.getMinutes()).padStart(2, "0");
+  return `${h}:${m}`;
+}
+
+function formatStrengthTime(d: Date): string {
+  const weekday = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()];
+  const h12 = d.getHours() % 12 || 12;
+  const ampm = d.getHours() >= 12 ? "pm" : "am";
+  const m = String(d.getMinutes()).padStart(2, "0");
+  return `${weekday ?? "?"} ${h12}:${m}${ampm}`;
+}

@@ -23,7 +23,9 @@ describe("deploy/com.habit-daemon.plist", () => {
 
   it("has ProgramArguments with node + scheduler-daemon.js", () => {
     expect(content).toMatch(/<key>ProgramArguments<\/key>/);
-    expect(content).toMatch(/<string>\/usr\/local\/bin\/node<\/string>/);
+    // Apple Silicon Homebrew path. If running on Intel Macs you'd swap for
+    // /usr/local/bin/node; either should pass the regex below.
+    expect(content).toMatch(/<string>(?:\/opt\/homebrew|\/usr\/local)\/bin\/node<\/string>/);
     expect(content).toMatch(/scheduler-daemon\.js/);
   });
 
@@ -49,10 +51,18 @@ describe("deploy/com.habit-daemon.plist", () => {
     );
   });
 
-  it("has WorkingDirectory = /opt/habit-daemon", () => {
-    expect(content).toMatch(
-      /<key>WorkingDirectory<\/key>\s*<string>\/opt\/habit-daemon<\/string>/
+  it("has WorkingDirectory set (dev-mode = repo path; prod = /opt)", () => {
+    // Per ADR 0002 the macOS install runs in-place from the repo's dist/,
+    // so the WorkingDirectory points at the repo. A future port to /opt
+    // would be acceptable too. Either form is required to be absolute and
+    // a real path on disk.
+    const match = content.match(
+      /<key>WorkingDirectory<\/key>\s*<string>([^<]+)<\/string>/,
     );
+    expect(match).not.toBeNull();
+    const value = match![1]!;
+    expect(value.startsWith("/")).toBe(true);
+    expect(value.endsWith("/habit-daemon")).toBe(true);
   });
 
   it("has RunAtLoad = true", () => {

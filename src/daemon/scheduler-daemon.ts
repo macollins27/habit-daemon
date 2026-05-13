@@ -1,23 +1,25 @@
-// Long-running scheduler entry point. Run via systemd (canonical) or
-// supervisord / pm2 (alternative). Polls the schedules table every minute,
-// dispatches due verbs, sd_notify's the watchdog every 60s, writes a
+// Long-running scheduler entry point. Run via launchd (macOS — see
+// deploy/com.habit-daemon.plist) or systemd on Linux. Polls the schedules
+// table every tick, dispatches due verbs via the in-process verb map from
+// bootstrap.ts, sd_notify's the watchdog every iteration, writes a
 // heartbeat file every iteration.
 //
-// Environment:
-//   HABIT_LEDGER_DB             ledger path
-//   PROJECT_ROOT              repo root (for bin/dispatch resolution)
-//   NOTIFY_SOCKET             systemd Type=notify watchdog socket (set by systemd)
-//   HABIT_HEARTBEAT_FILE        heartbeat-file path (default $HABIT_STATE_DIR/habit-daemon.heartbeat)
+// Environment (loaded by bootstrap.ts from ~/.habit-daemon/env unless
+// already set by launchd's EnvironmentVariables block):
+//   HABIT_LEDGER_DB             ledger path (default ~/.habit-daemon/state.db)
+//   HABIT_STATE_DIR             state dir override
+//   HABIT_HEARTBEAT_FILE        heartbeat-file path
 //   HABIT_TICK_INTERVAL_SEC     polling interval (default 30; min 10)
 //   HABIT_WAL_CHECKPOINT_SEC    interval between WAL checkpoint pragma (default 600)
-//
-// References:
-//   - docs/orchestrator/deploy.md (operational guide)
+//   ANTHROPIC_API_KEY           Claude CLI auth (with --bare flag)
+//   DISCORD_BOT_TOKEN           Discord bot auth
+//   DISCORD_CHANNEL_*           channel id env vars
+//   NOTIFY_SOCKET               systemd Type=notify watchdog socket (set by systemd; unset on launchd)
 
 import { spawnSync } from "node:child_process";
-import { resolve } from "node:path";
 import { Ledger } from "./ledger.js";
 import { schedulerTick, type DispatchFn } from "./scheduler.js";
+import { bootstrap } from "./bootstrap.js";
 import {
   resolveHeartbeatPath as libResolveHeartbeatPath,
   writeHeartbeat as libWriteHeartbeat,
@@ -28,14 +30,6 @@ function info(line: string): void {
 }
 function err(line: string): void {
   process.stderr.write(`[habit-daemon] ${line}\n`);
-}
-
-function resolveDbPath(): string {
-  if (process.env.HABIT_LEDGER_DB) return process.env.HABIT_LEDGER_DB;
-  const stateDir =
-    process.env.HABIT_STATE_DIR ??
-    resolve(process.env.PROJECT_ROOT ?? process.cwd(), ".claude/state");
-  return resolve(stateDir, "orchestrator-ledger.db");
 }
 
 function resolveHeartbeatPath(): string {
@@ -58,40 +52,6 @@ function clampInterval(envValue: string | undefined, defaultSec: number, minSec:
   const n = envValue !== undefined ? Number(envValue) : NaN;
   if (!Number.isInteger(n) || n < minSec) return defaultSec;
   return n;
-}
-
-function defaultDispatchBin(): string {
-  return resolve(process.env.PROJECT_ROOT ?? process.cwd(), "bin/dispatch");
-}
-
-function parseArgsJson(argsJson: string): readonly string[] {
-  try {
-    const parsed = JSON.parse(argsJson) as unknown;
-    return Array.isArray(parsed) ? parsed.filter((a): a is string => typeof a === "string") : [];
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Phase A dispatch factory. Spawns `bin/dispatch <verb> <args...>` via /usr/bin/env
- * and throws on non-zero exit so schedulerTick can route the failure through
- * its missed_run_policy branch. To be replaced by an in-process verb dispatch
- * map in a later phase.
- */
-function makeSubprocessDispatch(dispatchBin: string): DispatchFn {
-  return async (verb: string, argsJson: string): Promise<void> => {
-    const args = parseArgsJson(argsJson);
-    const result = spawnSync("/usr/bin/env", [dispatchBin, verb, ...args], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const exitCode = result.status ?? -1;
-    if (exitCode !== 0) {
-      const stderrTail = (result.stderr ?? "").slice(0, 500);
-      throw new Error(`bin/dispatch ${verb} exited ${String(exitCode)}: ${stderrTail}`);
-    }
-  };
 }
 
 export interface LoopContext {
@@ -153,23 +113,21 @@ export function createLoop(ctx: LoopContext): () => Promise<void> {
   return loop;
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const tickIntervalSec = clampInterval(process.env.HABIT_TICK_INTERVAL_SEC, 30, 10);
   const walCheckpointSec = clampInterval(process.env.HABIT_WAL_CHECKPOINT_SEC, 600, 60);
-
-  const dbPath = resolveDbPath();
   const heartbeatPath = resolveHeartbeatPath();
-  const dispatchBin = defaultDispatchBin();
 
   info(`starting (tick=${String(tickIntervalSec)}s, wal-checkpoint=${String(walCheckpointSec)}s)`);
-  info(`ledger:    ${dbPath}`);
   info(`heartbeat: ${heartbeatPath}`);
-  info(`bin/dispatch:   ${dispatchBin}`);
 
-  const ledger = new Ledger({ dbPath });
-  const dispatch = makeSubprocessDispatch(dispatchBin);
+  // Bootstrap loads env, opens the ledger, runs migrations, seeds habits,
+  // registers cron rows, logs in the Discord client, and returns the
+  // in-process verb dispatch function. See src/daemon/bootstrap.ts.
+  const { ledger, dispatch, sessionId, cleanup } = await bootstrap();
+  info(`bootstrap complete (session=${sessionId})`);
 
-  // sd_notify READY=1 (systemd Type=notify required signal)
+  // sd_notify READY=1 (systemd Type=notify required signal; no-op on launchd)
   sdNotifyViaCli("READY=1");
 
   let stop = false;
@@ -177,6 +135,10 @@ function main(): void {
     info(`received ${sig}, shutting down`);
     sdNotifyViaCli("STOPPING=1");
     stop = true;
+    cleanup().catch((e: unknown) => {
+      const msg = e instanceof Error ? e.message : String(e);
+      err(`cleanup exception during ${sig}: ${msg}`);
+    });
   };
   process.on("SIGTERM", () => {
     onSignal("SIGTERM");
@@ -215,5 +177,9 @@ const invokedDirectly =
   process.argv[1]?.endsWith("scheduler-daemon.js") === true;
 
 if (invokedDirectly) {
-  main();
+  main().catch((e: unknown) => {
+    const msg = e instanceof Error ? e.message : String(e);
+    err(`fatal: ${msg}`);
+    process.exit(1);
+  });
 }

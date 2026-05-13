@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# habit-daemon install script (macOS / launchd).
-# Builds the project, copies artifacts to /opt/habit-daemon, installs
-# the LaunchAgent plist, and bootstraps the daemon via launchctl.
+# habit-daemon install script (macOS / launchd, dev-mode install).
 #
-# Per ADR 0002. Requires: pnpm, sudo, ~/.habit-daemon/ already provisioned
+# Builds the project in-place and installs the LaunchAgent plist that points
+# at this repo's `dist/`. No sudo, no /opt copy — appropriate for the
+# single-user single-host deployment per ADR 0002.
+#
+# Per ADR 0002. Requires: pnpm, ~/.habit-daemon/ already provisioned
 # (env file + credentials per pre-Phase-A logistics).
 #
 # Paths are hardcoded to the founder's host (/Users/maxwellcollins/...).
-# If this is ever ported to another machine, update the StandardOut/Err
-# paths inside deploy/com.habit-daemon.plist accordingly.
+# The plist's ProgramArguments + StandardOut/Err paths must match this
+# host. Update deploy/com.habit-daemon.plist if porting to another machine.
 
 set -euo pipefail
 
-INSTALL_ROOT="/opt/habit-daemon"
 PLIST_NAME="com.habit-daemon"
 LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
 PLIST_SOURCE="deploy/$PLIST_NAME.plist"
@@ -25,23 +26,15 @@ test -d "$HOME/.habit-daemon" || { echo "ERROR: ~/.habit-daemon/ not provisioned
 test -f "$HOME/.habit-daemon/env" || { echo "ERROR: ~/.habit-daemon/env missing."; exit 1; }
 mkdir -p "$HOME/.habit-daemon/logs"
 
-# 2. Build
+# 2. Build (in-place; daemon runs from this repo's dist/)
 echo "Building..."
 pnpm install --frozen-lockfile
 pnpm build
 
-# 3. Copy artifacts to /opt/habit-daemon
-echo "Installing to $INSTALL_ROOT..."
-sudo mkdir -p "$INSTALL_ROOT"
-sudo rm -rf "$INSTALL_ROOT/dist" "$INSTALL_ROOT/scripts" "$INSTALL_ROOT/node_modules"
-sudo cp -r dist "$INSTALL_ROOT/"
-# SQL migrations need to be alongside compiled JS (tsc doesn't copy them)
-sudo mkdir -p "$INSTALL_ROOT/dist/db/migrations"
-sudo cp src/db/migrations/*.sql "$INSTALL_ROOT/dist/db/migrations/"
-sudo cp -r scripts "$INSTALL_ROOT/"
-sudo cp -r node_modules "$INSTALL_ROOT/"
-sudo cp package.json "$INSTALL_ROOT/"
-sudo chown -R "$(whoami):staff" "$INSTALL_ROOT"
+# 3. Copy SQL migrations into dist/db/migrations (tsc doesn't copy non-.ts assets)
+echo "Copying SQL migrations into dist/..."
+mkdir -p dist/db/migrations
+cp src/db/migrations/*.sql dist/db/migrations/
 
 # 4. Install plist
 mkdir -p "$LAUNCH_AGENT_DIR"
@@ -54,10 +47,15 @@ launchctl bootstrap "gui/$(id -u)" "$PLIST_TARGET"
 launchctl kickstart -k "gui/$(id -u)/$PLIST_NAME"
 
 # 6. Verify
-sleep 2
+sleep 3
 if launchctl print "gui/$(id -u)/$PLIST_NAME" >/dev/null 2>&1; then
+  echo ""
   echo "habit-daemon installed and running"
-  echo "Logs: tail -f $HOME/.habit-daemon/logs/stderr.log"
+  echo ""
+  echo "  Status: launchctl print gui/\$(id -u)/$PLIST_NAME"
+  echo "  Logs:   tail -f $HOME/.habit-daemon/logs/stderr.log"
+  echo "  Stop:   launchctl bootout gui/\$(id -u)/$PLIST_TARGET"
+  echo ""
 else
   echo "ERROR: daemon failed to start. Check logs at $HOME/.habit-daemon/logs/"
   exit 1

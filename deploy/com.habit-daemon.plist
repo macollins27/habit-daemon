@@ -7,19 +7,27 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/node</string>
-        <string>/opt/habit-daemon/dist/daemon/scheduler-daemon.js</string>
+        <string>/opt/homebrew/bin/node</string>
+        <string>/Users/maxwellcollins/Developer/habit-daemon/dist/daemon/scheduler-daemon.js</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/opt/habit-daemon</string>
+    <string>/Users/maxwellcollins/Developer/habit-daemon</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>NODE_ENV</key>
         <string>production</string>
-        <!-- Other env vars are sourced from ~/.habit-daemon/env at daemon startup
-             via the bootstrap code (not yet wired - Phase A retro item). -->
+        <!-- Heartbeat file path. Default would land under the repo's
+             .claude/state/ which is gitignored and may not exist; pin to
+             ~/.habit-daemon/ alongside the env file + logs. -->
+        <key>HABIT_HEARTBEAT_FILE</key>
+        <string>/Users/maxwellcollins/.habit-daemon/heartbeat</string>
+        <key>HABIT_STATE_DIR</key>
+        <string>/Users/maxwellcollins/.habit-daemon</string>
+        <!-- Application env vars (ANTHROPIC_API_KEY, DISCORD_BOT_TOKEN, the
+             5 DISCORD_CHANNEL_* ids) are loaded by bootstrap.ts from
+             ~/.habit-daemon/env at process start. -->
     </dict>
 
     <key>RunAtLoad</key>
