@@ -21,6 +21,7 @@
  */
 
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import { z } from "zod";
 import { statSync, readFileSync } from "node:fs";
@@ -260,6 +261,26 @@ export function buildApp(deps: ApiDeps): Hono {
   // SessionStore via the closure without reaching for module-level
   // singletons.
   const app = new Hono();
+
+  // CORS: deny by default, allow only the configured SPA origin.
+  //
+  // The allow-list is sourced from `process.env.SPA_ORIGIN` at REQUEST
+  // time (inside the closure), not at app-build time, so tests can set
+  // and unset the env var per test without rebuilding the app. The
+  // function-form `origin` returns `null` to skip emission rather than
+  // returning the request's origin verbatim — that's the deny-by-default
+  // behaviour the spec requires when `SPA_ORIGIN` is unset.
+  app.use(
+    "/api/*",
+    cors({
+      origin: (origin): string | null => {
+        const allowed = process.env.SPA_ORIGIN;
+        if (allowed === undefined || allowed === "") return null;
+        return origin === allowed ? origin : null;
+      },
+      credentials: true,
+    }),
+  );
 
   // GET /api/health — daemon liveness + sensor freshness payload.
   //
