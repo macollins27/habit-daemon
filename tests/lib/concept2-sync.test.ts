@@ -94,7 +94,52 @@ function readAllSignals(db: Database.Database): SensorSignalRow[] {
     .all() as SensorSignalRow[];
 }
 
-const SAMPLE_ROW_A: Concept2Result = {
+// Raw upstream rows match the Concept2 Logbook API shape:
+//   `time` is in deciseconds (tenths of a second), `distance` is in meters.
+// fetchRowsBetween() inside syncDate transforms these into the internal
+// Concept2Result shape (`duration_seconds`, `distance_meters`) before they
+// are serialized into the sensor_signals payload_json. Phase 7 test-hygiene:
+// mocks intentionally use the raw shape so the boundary transform is
+// exercised end-to-end. A regression like the 2026-05-13 outage (raw
+// `time` accidentally treated as seconds) would surface here immediately.
+interface Concept2RawRow {
+  readonly id: number;
+  readonly date: string;
+  readonly type: string;
+  readonly time: number; // deciseconds
+  readonly distance: number; // meters
+  readonly time_formatted: string;
+}
+
+const RAW_ROW_A: Concept2RawRow = {
+  id: 100,
+  date: "2026-05-12 09:15:00",
+  type: "rower",
+  time: 7200, // 720.0 s
+  distance: 2143,
+  time_formatted: "12:00.0",
+};
+
+const RAW_ROW_B: Concept2RawRow = {
+  id: 101,
+  date: "2026-05-12 18:00:00",
+  type: "rower",
+  time: 6000, // 600.0 s
+  distance: 1800,
+  time_formatted: "10:00.0",
+};
+
+const RAW_ROW_C: Concept2RawRow = {
+  id: 102,
+  date: "2026-05-12 21:30:00",
+  type: "rower",
+  time: 5400, // 540.0 s
+  distance: 1600,
+  time_formatted: "9:00.0",
+};
+
+// Expected post-transform results (Concept2Result internal shape).
+const EXPECTED_ROW_A: Concept2Result = {
   id: 100,
   date: "2026-05-12 09:15:00",
   type: "rower",
@@ -102,7 +147,7 @@ const SAMPLE_ROW_A: Concept2Result = {
   distance_meters: 2143,
 };
 
-const SAMPLE_ROW_B: Concept2Result = {
+const EXPECTED_ROW_B: Concept2Result = {
   id: 101,
   date: "2026-05-12 18:00:00",
   type: "rower",
@@ -110,7 +155,7 @@ const SAMPLE_ROW_B: Concept2Result = {
   distance_meters: 1800,
 };
 
-const SAMPLE_ROW_C: Concept2Result = {
+const EXPECTED_ROW_C: Concept2Result = {
   id: 102,
   date: "2026-05-12 21:30:00",
   type: "rower",
@@ -140,7 +185,7 @@ describe("syncDate() — happy path", () => {
         {
           ok: true,
           body: {
-            data: [SAMPLE_ROW_A, SAMPLE_ROW_B],
+            data: [RAW_ROW_A, RAW_ROW_B],
             links: { next: null },
           },
         },
@@ -167,13 +212,14 @@ describe("syncDate() — happy path", () => {
     const parsed = JSON.parse(row.payload_json) as {
       results: Concept2Result[];
     };
-    expect(parsed).toEqual({ results: [SAMPLE_ROW_A, SAMPLE_ROW_B] });
+    // payload_json holds the post-transform internal shape.
+    expect(parsed).toEqual({ results: [EXPECTED_ROW_A, EXPECTED_ROW_B] });
   });
 
   it("queries fetchRowsBetween with from === to === opts.date (YYYY-MM-DD)", async () => {
     const recorder: { calls: RecordedRequest[] } = { calls: [] };
     const fetchImpl = makeMultiFetchMock(
-      [{ ok: true, body: { data: [SAMPLE_ROW_A], links: { next: null } } }],
+      [{ ok: true, body: { data: [RAW_ROW_A], links: { next: null } } }],
       recorder
     );
 
@@ -256,10 +302,10 @@ describe("syncDate() — idempotency", () => {
   });
 
   it("a second sync for the same date replaces the existing row (no duplicates)", async () => {
-    // First sync: returns row A only.
+    // First sync: returns row A only (raw upstream shape).
     const recorder1: { calls: RecordedRequest[] } = { calls: [] };
     const fetchImpl1 = makeMultiFetchMock(
-      [{ ok: true, body: { data: [SAMPLE_ROW_A], links: { next: null } } }],
+      [{ ok: true, body: { data: [RAW_ROW_A], links: { next: null } } }],
       recorder1
     );
 
@@ -278,14 +324,14 @@ describe("syncDate() — idempotency", () => {
     // Advance the clock so we can verify fetched_at updates on replace.
     vi.setSystemTime(new Date("2026-05-12T13:00:00.000Z"));
 
-    // Second sync: returns rows A and B.
+    // Second sync: returns rows A and B (raw upstream shape).
     const recorder2: { calls: RecordedRequest[] } = { calls: [] };
     const fetchImpl2 = makeMultiFetchMock(
       [
         {
           ok: true,
           body: {
-            data: [SAMPLE_ROW_A, SAMPLE_ROW_B],
+            data: [RAW_ROW_A, RAW_ROW_B],
             links: { next: null },
           },
         },
@@ -310,7 +356,8 @@ describe("syncDate() — idempotency", () => {
     const parsed = JSON.parse(secondRows[0].payload_json) as {
       results: Concept2Result[];
     };
-    expect(parsed.results).toEqual([SAMPLE_ROW_A, SAMPLE_ROW_B]);
+    // payload_json holds the post-transform internal shape.
+    expect(parsed.results).toEqual([EXPECTED_ROW_A, EXPECTED_ROW_B]);
   });
 });
 
@@ -346,10 +393,10 @@ describe("syncDate() — 401 + refresh integration", () => {
             scope: "user:read,results:read",
           },
         },
-        // 3) retry GET → 200 with data
+        // 3) retry GET → 200 with data (raw upstream shape)
         {
           ok: true,
-          body: { data: [SAMPLE_ROW_B], links: { next: null } },
+          body: { data: [RAW_ROW_B], links: { next: null } },
         },
       ],
       recorder
@@ -374,7 +421,8 @@ describe("syncDate() — 401 + refresh integration", () => {
     const parsed = JSON.parse(rows[0].payload_json) as {
       results: Concept2Result[];
     };
-    expect(parsed.results).toEqual([SAMPLE_ROW_B]);
+    // payload_json holds the post-transform internal shape.
+    expect(parsed.results).toEqual([EXPECTED_ROW_B]);
   });
 });
 
@@ -400,7 +448,7 @@ describe("syncDate() — pagination integration", () => {
         {
           ok: true,
           body: {
-            data: [SAMPLE_ROW_A, SAMPLE_ROW_B],
+            data: [RAW_ROW_A, RAW_ROW_B],
             links: {
               next: "https://log.concept2.com/api/users/me/results?from=2026-05-12&to=2026-05-12&page=2",
             },
@@ -408,7 +456,7 @@ describe("syncDate() — pagination integration", () => {
         },
         {
           ok: true,
-          body: { data: [SAMPLE_ROW_C], links: { next: null } },
+          body: { data: [RAW_ROW_C], links: { next: null } },
         },
       ],
       recorder
@@ -428,7 +476,12 @@ describe("syncDate() — pagination integration", () => {
     const parsed = JSON.parse(rows[0].payload_json) as {
       results: Concept2Result[];
     };
-    expect(parsed.results).toEqual([SAMPLE_ROW_A, SAMPLE_ROW_B, SAMPLE_ROW_C]);
+    // payload_json holds the post-transform internal shape.
+    expect(parsed.results).toEqual([
+      EXPECTED_ROW_A,
+      EXPECTED_ROW_B,
+      EXPECTED_ROW_C,
+    ]);
   });
 });
 

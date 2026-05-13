@@ -75,7 +75,52 @@ function makeMultiFetchMock(
   }) as typeof fetch;
 }
 
-const SAMPLE_ROW_A: Concept2Result = {
+// Raw upstream rows match the Concept2 Logbook API shape:
+//   `time` is in deciseconds (tenths of a second), `distance` is in meters.
+// The adapter's fetchRowsBetween() is responsible for converting these to
+// the internal Concept2Result (`duration_seconds`, `distance_meters`).
+// Phase 7 test-hygiene: mocks intentionally use the raw shape so the
+// boundary transform is exercised end-to-end. A regression like the
+// 2026-05-13 outage (raw `time` accidentally treated as seconds) would
+// surface here immediately.
+interface Concept2RawRow {
+  readonly id: number;
+  readonly date: string;
+  readonly type: string;
+  readonly time: number; // deciseconds
+  readonly distance: number; // meters
+  readonly time_formatted: string;
+}
+
+const RAW_ROW_A: Concept2RawRow = {
+  id: 100,
+  date: "2026-05-12 09:15:00",
+  type: "rower",
+  time: 7200, // 720.0 s
+  distance: 2143,
+  time_formatted: "12:00.0",
+};
+
+const RAW_ROW_B: Concept2RawRow = {
+  id: 101,
+  date: "2026-05-12 18:00:00",
+  type: "rower",
+  time: 6000, // 600.0 s
+  distance: 1800,
+  time_formatted: "10:00.0",
+};
+
+const RAW_ROW_C: Concept2RawRow = {
+  id: 102,
+  date: "2026-05-12 21:30:00",
+  type: "rower",
+  time: 5400, // 540.0 s
+  distance: 1600,
+  time_formatted: "9:00.0",
+};
+
+// Expected post-transform results (Concept2Result internal shape).
+const EXPECTED_ROW_A: Concept2Result = {
   id: 100,
   date: "2026-05-12 09:15:00",
   type: "rower",
@@ -83,7 +128,7 @@ const SAMPLE_ROW_A: Concept2Result = {
   distance_meters: 2143,
 };
 
-const SAMPLE_ROW_B: Concept2Result = {
+const EXPECTED_ROW_B: Concept2Result = {
   id: 101,
   date: "2026-05-12 18:00:00",
   type: "rower",
@@ -91,7 +136,7 @@ const SAMPLE_ROW_B: Concept2Result = {
   distance_meters: 1800,
 };
 
-const SAMPLE_ROW_C: Concept2Result = {
+const EXPECTED_ROW_C: Concept2Result = {
   id: 102,
   date: "2026-05-12 21:30:00",
   type: "rower",
@@ -107,7 +152,7 @@ describe("fetchRowsBetween() happy path", () => {
         {
           ok: true,
           body: {
-            data: [SAMPLE_ROW_A, SAMPLE_ROW_B],
+            data: [RAW_ROW_A, RAW_ROW_B],
             meta: { total_count: 2 },
             links: { first: "...", next: null, prev: null, last: "..." },
           },
@@ -135,7 +180,8 @@ describe("fetchRowsBetween() happy path", () => {
     expect(url.searchParams.get("to")).toBe("2026-05-12");
     expect(call.headers["authorization"]).toBe("Bearer AT-original");
 
-    expect(results).toEqual([SAMPLE_ROW_A, SAMPLE_ROW_B]);
+    // Adapter transforms raw {time, distance} → {duration_seconds, distance_meters}.
+    expect(results).toEqual([EXPECTED_ROW_A, EXPECTED_ROW_B]);
   });
 
   it("returns an empty array when the API returns no rows", async () => {
@@ -184,10 +230,10 @@ describe("fetchRowsBetween() 401 + refresh", () => {
             scope: "user:read,results:read",
           },
         },
-        // 3) retry GET → 200 with data
+        // 3) retry GET → 200 with data (raw upstream shape)
         {
           ok: true,
-          body: { data: [SAMPLE_ROW_A], links: { next: null } },
+          body: { data: [RAW_ROW_A], links: { next: null } },
         },
       ],
       recorder
@@ -230,8 +276,8 @@ describe("fetchRowsBetween() 401 + refresh", () => {
     expect(refreshed[0].refresh_token).toBe("RT-new");
     expect(refreshed[0].expires_at).toBe(Date.now() + 7200 * 1000);
 
-    // final data
-    expect(results).toEqual([SAMPLE_ROW_A]);
+    // final data (post-transform)
+    expect(results).toEqual([EXPECTED_ROW_A]);
   });
 
   it("throws when the retry GET also returns 401", async () => {
@@ -277,7 +323,7 @@ describe("fetchRowsBetween() pagination", () => {
         {
           ok: true,
           body: {
-            data: [SAMPLE_ROW_A, SAMPLE_ROW_B],
+            data: [RAW_ROW_A, RAW_ROW_B],
             links: {
               next: "https://log.concept2.com/api/users/me/results?from=2026-05-12&to=2026-05-12&page=2",
             },
@@ -286,7 +332,7 @@ describe("fetchRowsBetween() pagination", () => {
         {
           ok: true,
           body: {
-            data: [SAMPLE_ROW_C],
+            data: [RAW_ROW_C],
             links: { next: null },
           },
         },
@@ -310,7 +356,7 @@ describe("fetchRowsBetween() pagination", () => {
       "Bearer AT-original"
     );
 
-    expect(results).toEqual([SAMPLE_ROW_A, SAMPLE_ROW_B, SAMPLE_ROW_C]);
+    expect(results).toEqual([EXPECTED_ROW_A, EXPECTED_ROW_B, EXPECTED_ROW_C]);
   });
 
   it("throws if pagination exceeds the defensive cap", async () => {
@@ -338,7 +384,7 @@ describe("fetchRowsBetween() pagination", () => {
         ok: true,
         status: 200,
         json: async () => ({
-          data: [SAMPLE_ROW_A],
+          data: [RAW_ROW_A],
           links: {
             next: "https://log.concept2.com/api/users/me/results?page=loop",
           },
