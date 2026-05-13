@@ -40,15 +40,29 @@ afterEach(() => {
 });
 
 describe("buildApp (Hono skeleton)", () => {
-  it("GET /api/health returns 200 with heartbeat_age_seconds in body", async () => {
+  it("GET /api/health returns 200 with the rich daemon-status shape", async () => {
     const app = buildApp({ sessionStore: ledger.sessionStore });
     const res = await app.request("/api/health");
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { heartbeat_age_seconds: unknown };
+    const body = (await res.json()) as {
+      heartbeat_age_seconds: unknown;
+      last_tick_iso: unknown;
+      discord_connected: unknown;
+      concept2_token_expires_at: unknown;
+      last_garmin_sync_iso: unknown;
+      recent_dispatch_failures_24h: unknown;
+    };
     expect(body).toHaveProperty("heartbeat_age_seconds");
-    // Placeholder: must be a number (zero or otherwise). Task 2.10 will
-    // enrich this; for now we only assert the shape.
-    expect(typeof body.heartbeat_age_seconds).toBe("number");
+    expect(body).toHaveProperty("last_tick_iso");
+    expect(body).toHaveProperty("discord_connected");
+    expect(body).toHaveProperty("concept2_token_expires_at");
+    expect(body).toHaveProperty("last_garmin_sync_iso");
+    expect(body).toHaveProperty("recent_dispatch_failures_24h");
+    // Without any deps wired in, the heartbeat/concept2/garmin fields are
+    // null and discord defaults to false (Task 2.13 wires the real values
+    // at daemon-bootstrap time).
+    expect(body.discord_connected).toBe(false);
+    expect(typeof body.recent_dispatch_failures_24h).toBe("number");
   });
 
   it("returns 404 on an unknown route", async () => {

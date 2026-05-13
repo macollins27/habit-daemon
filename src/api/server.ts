@@ -23,6 +23,7 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { z } from "zod";
+import { statSync, readFileSync } from "node:fs";
 import type { SessionStore } from "../daemon/session-store.js";
 import { serializeHabit, type HabitResponse } from "./serialize.js";
 import { computeStats, type HabitRunForStats } from "./stats.js";
@@ -88,6 +89,39 @@ interface HabitRunRow {
 
 export interface ApiDeps {
   readonly sessionStore: SessionStore;
+  /**
+   * Path to the daemon's heartbeat file (mtime → freshness). Optional —
+   * when omitted the /api/health endpoint reports heartbeat as null.
+   * Production wires this from `src/daemon/heartbeat.ts::resolveHeartbeatPath`.
+   */
+  readonly heartbeatPath?: string;
+  /**
+   * Snapshot of the live Discord adapter's connected state. Optional —
+   * defaults to `() => false` so pre-bootstrap envs / tests can hit the
+   * endpoint without faking a Discord client. The daemon wires the real
+   * adapter callback at startup.
+   */
+  readonly discordConnected?: () => boolean;
+  /**
+   * Path to the persisted Concept2 OAuth tokens file. Optional — when the
+   * file is missing or malformed the /api/health endpoint reports the
+   * `concept2_token_expires_at` field as null rather than 500-ing.
+   */
+  readonly concept2TokensPath?: string;
+  /**
+   * Wall-clock injection seam so the 24h failures-window boundary is
+   * deterministically testable. Defaults to `() => new Date()`.
+   */
+  readonly now?: () => Date;
+}
+
+export interface HealthResponse {
+  readonly heartbeat_age_seconds: number | null;
+  readonly last_tick_iso: string | null;
+  readonly discord_connected: boolean;
+  readonly concept2_token_expires_at: string | null;
+  readonly last_garmin_sync_iso: string | null;
+  readonly recent_dispatch_failures_24h: number;
 }
 
 export interface HabitListItem extends HabitResponse {
@@ -113,6 +147,111 @@ export interface ServerHandle {
   readonly close: () => void;
 }
 
+/**
+ * Read the heartbeat file's mtime and translate it into the health
+ * payload's `heartbeat_age_seconds` / `last_tick_iso` pair. Returns nulls
+ * when the file is missing OR cannot be stat'd — both cases are recoverable
+ * states for a freshly-installed daemon and must not 500 the endpoint.
+ */
+function readHeartbeat(
+  heartbeatPath: string | undefined,
+  now: Date,
+): { ageSec: number | null; lastTickIso: string | null } {
+  if (heartbeatPath === undefined) {
+    return { ageSec: null, lastTickIso: null };
+  }
+  try {
+    const st = statSync(heartbeatPath);
+    const mtimeMs = st.mtimeMs;
+    const ageSec = Math.max(0, Math.floor((now.getTime() - mtimeMs) / 1000));
+    return { ageSec, lastTickIso: new Date(mtimeMs).toISOString() };
+  } catch {
+    return { ageSec: null, lastTickIso: null };
+  }
+}
+
+/**
+ * Parse the persisted Concept2 tokens file and convert the stored epoch-ms
+ * `expires_at` to an ISO timestamp. Returns null on missing-file, malformed
+ * JSON, or a non-numeric `expires_at` — the health endpoint should never
+ * 500 on a credential-surface read.
+ */
+function readConcept2Expiry(tokensPath: string | undefined): string | null {
+  if (tokensPath === undefined) return null;
+  try {
+    const raw = readFileSync(tokensPath, "utf8");
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      parsed === null ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed)
+    ) {
+      return null;
+    }
+    const expiresAt = (parsed as Record<string, unknown>)["expires_at"];
+    if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt)) {
+      return null;
+    }
+    return new Date(expiresAt).toISOString();
+  } catch {
+    return null;
+  }
+}
+
+interface MaxFetchedAtRow {
+  readonly max_fetched_at: number | null;
+}
+
+interface FailuresCountRow {
+  readonly n: number;
+}
+
+/**
+ * Aggregate every health field into a single HealthResponse. Pure (apart
+ * from filesystem reads + the SessionStore query) and synchronous — the
+ * /api/health route is a thin wrapper.
+ */
+function computeHealth(deps: ApiDeps, now: Date): HealthResponse {
+  const { ageSec, lastTickIso } = readHeartbeat(deps.heartbeatPath, now);
+  const concept2Expiry = readConcept2Expiry(deps.concept2TokensPath);
+  const discordConnected = deps.discordConnected?.() ?? false;
+
+  const garminRow = deps.sessionStore.db
+    .prepare(
+      `SELECT MAX(fetched_at) AS max_fetched_at
+         FROM sensor_signals
+        WHERE source = 'garmin'`,
+    )
+    .get() as MaxFetchedAtRow | undefined;
+  const lastGarminSyncIso =
+    garminRow && typeof garminRow.max_fetched_at === "number"
+      ? new Date(garminRow.max_fetched_at).toISOString()
+      : null;
+
+  // 24h cutoff for failed dispatches. `dispatched_iso` is the start ISO
+  // string per the ledger schema — lexicographic comparison on
+  // ISO-8601 strings is equivalent to chronological comparison, so a
+  // plain SQL `>` works without parsing.
+  const cutoffIso = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+  const failuresRow = deps.sessionStore.db
+    .prepare(
+      `SELECT COUNT(*) AS n
+         FROM dispatches
+        WHERE findings_status = 'FAILED'
+          AND dispatched_iso > ?`,
+    )
+    .get(cutoffIso) as FailuresCountRow;
+
+  return {
+    heartbeat_age_seconds: ageSec,
+    last_tick_iso: lastTickIso,
+    discord_connected: discordConnected,
+    concept2_token_expires_at: concept2Expiry,
+    last_garmin_sync_iso: lastGarminSyncIso,
+    recent_dispatch_failures_24h: failuresRow.n,
+  };
+}
+
 export function buildApp(deps: ApiDeps): Hono {
   // Each call must return a fresh instance — tests assert independence.
   // We intentionally do not memoize or share routers across builds.
@@ -122,12 +261,28 @@ export function buildApp(deps: ApiDeps): Hono {
   // singletons.
   const app = new Hono();
 
+  // GET /api/health — daemon liveness + sensor freshness payload.
+  //
+  // Every field is independently nullable so a partially-failed daemon
+  // (e.g., heartbeat file missing but DB up) still returns a structurally
+  // valid 200 response. Specific source-of-truth per field:
+  //   - heartbeat_age_seconds / last_tick_iso ← deps.heartbeatPath mtime
+  //   - discord_connected                     ← deps.discordConnected?.()
+  //   - concept2_token_expires_at             ← deps.concept2TokensPath JSON
+  //   - last_garmin_sync_iso                  ← MAX(sensor_signals.fetched_at)
+  //                                              filtered to source='garmin'
+  //                                              (the actual column is `source`
+  //                                              per migration 002, NOT `provider`)
+  //   - recent_dispatch_failures_24h          ← COUNT(*) from dispatches
+  //                                              where findings_status='FAILED'
+  //                                              and dispatched_iso > now-24h
+  //
+  // The `now` injection seam keeps the 24h-window boundary deterministic
+  // under test.
   app.get("/api/health", (c) => {
-    // Placeholder: Task 2.10 will compute heartbeat age from the daemon
-    // heartbeat file/row. The shape must already carry the field so the
-    // chat / web UI can wire up its consumer without waiting for the
-    // enrichment.
-    return c.json({ heartbeat_age_seconds: 0 });
+    const now = (deps.now ?? ((): Date => new Date()))();
+    const health = computeHealth(deps, now);
+    return c.json(health);
   });
 
   // GET /api/habits — list habits with today's run join.
