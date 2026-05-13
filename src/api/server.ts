@@ -23,9 +23,24 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import type { SessionStore } from "../daemon/session-store.js";
+import { serializeHabit, type HabitResponse } from "./serialize.js";
 
 export interface ApiDeps {
   readonly sessionStore: SessionStore;
+}
+
+export interface HabitListItem extends HabitResponse {
+  readonly today_run: {
+    readonly id: string;
+    readonly status: string;
+    readonly current_level: number;
+  } | null;
+}
+
+interface HabitListJoinRow extends Record<string, unknown> {
+  readonly _today_run_id: string | null;
+  readonly _today_status: string | null;
+  readonly _today_level: number | null;
 }
 
 export interface StartServerOptions {
@@ -51,8 +66,52 @@ export function buildApp(deps: ApiDeps): Hono {
     // heartbeat file/row. The shape must already carry the field so the
     // chat / web UI can wire up its consumer without waiting for the
     // enrichment.
-    void deps;
     return c.json({ heartbeat_age_seconds: 0 });
+  });
+
+  // GET /api/habits — list habits with today's run join.
+  //
+  // The LEFT JOIN against `habit_runs` filters on `fire_date = date('now')`
+  // so each row carries at most one "today" run (the schema's
+  // UNIQUE(habit_id, fire_date) makes this deterministic). The four
+  // `_today_*` aliases are stripped by the serializer downstream and
+  // re-emitted as a structured `today_run` object on the response.
+  //
+  // Ordering: descending `created_at` so the freshest habits surface first
+  // in the chat / web UI. Archive filter is opt-out via
+  // `?include_archived=1`.
+  app.get("/api/habits", (c) => {
+    const includeArchived = c.req.query("include_archived") === "1";
+    const where = includeArchived ? "" : "WHERE h.archived_at IS NULL";
+    const rows = deps.sessionStore.db
+      .prepare(
+        `SELECT h.*,
+                hr.id            AS _today_run_id,
+                hr.status        AS _today_status,
+                hr.current_level AS _today_level
+         FROM habits h
+         LEFT JOIN habit_runs hr
+           ON hr.habit_id = h.id
+          AND hr.fire_date = date('now')
+         ${where}
+         ORDER BY h.created_at DESC`,
+      )
+      .all() as ReadonlyArray<HabitListJoinRow>;
+    const habits: ReadonlyArray<HabitListItem> = rows.map((r) => {
+      const serialized = serializeHabit(r);
+      const todayRun: HabitListItem["today_run"] =
+        r._today_run_id !== null &&
+        r._today_status !== null &&
+        r._today_level !== null
+          ? {
+              id: r._today_run_id,
+              status: r._today_status,
+              current_level: r._today_level,
+            }
+          : null;
+      return { ...serialized, today_run: todayRun };
+    });
+    return c.json({ habits });
   });
 
   return app;
