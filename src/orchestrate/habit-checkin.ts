@@ -67,6 +67,7 @@ import {
 import { checkProvable } from "./check-provable.js";
 import { formatMorningRowSummary } from "./reconcile-pending-runs.js";
 import type { Concept2Result } from "../lib/concept2-adapter.js";
+import { localDateString } from "../lib/local-date.js";
 
 // -----------------------------------------------------------------------------
 // Per-habit escalation cadence (design § 3).
@@ -325,18 +326,6 @@ export const ESCALATION_FOLLOW_UP_CONTENT = "✓ Proof is in — see #wins.";
 // -----------------------------------------------------------------------------
 
 const DEFENSIVE_GUARD_DEFER_MS = 60 * 1000;
-
-// YYYY-MM-DD in process local time. Mirrors `localDateString` in
-// discord-adapter.ts — kept local because (a) it is five lines and (b) a
-// cross-module export for a single use would couple the orchestrate layer
-// to the discord layer for no shared behavior.
-function localDateString(epochMs: number): string {
-  const d = new Date(epochMs);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
 
 interface PartialWindDownRow {
   readonly _: 1;

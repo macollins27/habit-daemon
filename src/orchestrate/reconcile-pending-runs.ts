@@ -20,6 +20,7 @@
 import type Database from "better-sqlite3";
 import type { SessionStore } from "../daemon/session-store.js";
 import type { Concept2Result } from "../lib/concept2-adapter.js";
+import { localDateString } from "../lib/local-date.js";
 import { findQualifyingSession } from "./verify-proof-internals.js";
 import { ESCALATION_FOLLOW_UP_CONTENT } from "./habit-checkin.js";
 import { onsetBeyondThreshold } from "./evaluate-stage-b.js";
@@ -75,19 +76,6 @@ export interface ReconcileOptions {
 // -----------------------------------------------------------------------------
 // Internal helpers.
 // -----------------------------------------------------------------------------
-
-// YYYY-MM-DD in process local time. Matches the daemon's `fire_date`
-// writer (ADR 0001: cron expressions are interpreted in local time).
-// Inlined here rather than imported from `discord-adapter.ts` because the
-// helper is private to four other modules already (bootstrap.ts,
-// discord-adapter.ts, evaluate-stage-b.ts, habit-checkin.ts); centralising
-// would be a separate refactor. See task report for rationale.
-function localDateString(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
 
 interface PendingRunRow {
   readonly id: string;

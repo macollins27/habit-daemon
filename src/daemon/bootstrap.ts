@@ -56,6 +56,7 @@ import {
   type Concept2Tokens,
 } from "../lib/concept2-adapter.js";
 import { syncDate as garminSyncDate } from "../lib/garmin-adapter.js";
+import { localDateString } from "../lib/local-date.js";
 import { createHabitRun } from "../orchestrate/create-habit-run.js";
 import { runHabitCheckin } from "../orchestrate/habit-checkin.js";
 import {
@@ -158,17 +159,6 @@ function registerHabitMorningCrons(db: Database.Database): number {
     inserted++;
   }
   return inserted;
-}
-
-/**
- * Local date (process timezone) as YYYY-MM-DD. Matches the convention used by
- * the cron parser (ADR 0001) and other verbs that compute "today" / "yesterday".
- */
-function localDateString(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
 }
 
 /**

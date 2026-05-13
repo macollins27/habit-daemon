@@ -35,6 +35,8 @@ import {
 } from "discord.js";
 import type Database from "better-sqlite3";
 
+import { localDateString } from "./local-date.js";
+
 export type ChannelName =
   | "morning-row"
   | "strength"
@@ -355,15 +357,6 @@ function buildActiveChannelLookup(
     map.set(channelIds[name], name);
   }
   return map;
-}
-
-// YYYY-MM-DD in process local time. Matches the daemon's `fire_date`
-// writer (ADR 0001: cron expressions are interpreted in local time).
-function localDateString(now: Date): string {
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, "0");
-  const d = String(now.getDate()).padStart(2, "0");
-  return `${y}-${m}-${d}`;
 }
 
 // SQL for the single-row active-run lookup keyed by (channel_id, fire_date).
