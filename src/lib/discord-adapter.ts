@@ -386,19 +386,46 @@ export function subscribeMessages(opts: SubscribeMessagesOptions): Unsubscribe {
   );
 
   const onMessage = (msg: Message): void => {
+    // Diagnostic logging — every observed messageCreate is logged with the
+    // discriminators the handler uses to decide whether to process. If a
+    // user-posted message stops showing up here, the gateway/intent/connection
+    // layer is the problem, not the handler.
+    process.stdout.write(
+      `[discord-listener] messageCreate channelId=${msg.channelId} ` +
+        `author_bot=${msg.author?.bot ?? "(null)"} ` +
+        `content_len=${msg.content?.length ?? 0} ` +
+        `attachments=${msg.attachments?.size ?? 0}\n`,
+    );
+
     // discord.js's Message.author can be null in exotic webhook cases. The
     // optional chain plus `?? false` collapses both "no author" and
     // "human author" into "do not skip".
-    if (msg.author?.bot === true) return;
+    if (msg.author?.bot === true) {
+      process.stdout.write(`[discord-listener] skip: author is a bot\n`);
+      return;
+    }
 
     const channelName = activeChannels.get(msg.channelId);
-    if (channelName === undefined) return;
+    if (channelName === undefined) {
+      process.stdout.write(
+        `[discord-listener] skip: channel ${msg.channelId} is not in the active list\n`,
+      );
+      return;
+    }
 
     const today = localDateString(nowFn());
     const row = lookupRun.get(adapter.channelIds[channelName], today) as
       | ActiveHabitRun
       | undefined;
-    if (row === undefined) return;
+    if (row === undefined) {
+      process.stdout.write(
+        `[discord-listener] skip: no active habit_run for channel=${channelName} fire_date=${today}\n`,
+      );
+      return;
+    }
+    process.stdout.write(
+      `[discord-listener] match: invoking handler for run=${row.id} channel=${channelName}\n`,
+    );
 
     const match: MessageMatch = {
       run: row,
