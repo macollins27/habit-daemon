@@ -25,12 +25,14 @@
 -- We additionally use IF NOT EXISTS on every CREATE so a partial re-run
 -- (e.g. if the runner were ever bypassed) does not error.
 
--- ledger.hash_chain_record_id has a FK reference to session_events(id). The
--- table-rebuild below would otherwise trip FK enforcement (foreign_keys is
--- ON at the connection level — see src/db/connection.ts). `defer_foreign_keys`
--- is a transaction-scoped pragma that defers FK checks until COMMIT, by which
--- point all referenced ids have been copied verbatim into the new table.
-PRAGMA defer_foreign_keys = ON;
+-- ledger.dispatches.hash_chain_record_id has a FK reference to
+-- session_events(id). The table-rebuild below would otherwise trip FK
+-- enforcement at COMMIT (foreign_keys is ON at the connection level — see
+-- src/db/connection.ts). `PRAGMA defer_foreign_keys` does NOT defer the FK
+-- check fired by `ALTER TABLE ... RENAME`, so it cannot be relied on here.
+-- Instead, the migration runner (src/db/migrate.ts) disables FK enforcement
+-- around each migration and runs `PRAGMA foreign_key_check` after commit
+-- to verify the migration introduces no FK violations.
 
 -- 1. Add habits.archived_at. ALTER TABLE ADD COLUMN is safe here because
 --    the new column is nullable and has no default.
