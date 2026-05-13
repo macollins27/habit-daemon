@@ -164,6 +164,23 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     else:
         fields = []
 
+    if args.from_file:
+        # Test seam: read raw JSON from disk and skip auth + API call entirely.
+        # Lets vitest pin the projection contract without hitting the network
+        # or requiring a working token cache.
+        with open(args.from_file) as f:
+            raw = json.load(f)
+        if args.print_raw:
+            sys.stdout.write(json.dumps(raw, indent=2, default=str))
+            sys.exit(0)
+        if not raw:
+            sys.stdout.write("{}")
+            sys.exit(0)
+        projected = project_real_sleep(raw)
+        final = project_fields(projected, fields)
+        sys.stdout.write(json.dumps(final))
+        sys.exit(0)
+
     try:
         from garminconnect import Garmin  # type: ignore[import-not-found]
     except ImportError as exc:
@@ -227,6 +244,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--print-raw",
         action="store_true",
         help="Print the raw Garmin response without projection (debug only). Requires --date.",
+    )
+    parser.add_argument(
+        "--from-file",
+        help="Read raw JSON from this file instead of fetching (test fixture path).",
     )
     return parser
 
