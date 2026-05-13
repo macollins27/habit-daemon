@@ -22,8 +22,37 @@
 
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
+import { z } from "zod";
 import type { SessionStore } from "../daemon/session-store.js";
 import { serializeHabit, type HabitResponse } from "./serialize.js";
+
+// Bounded limit for the /runs endpoint. Defaults to 30, max 365 — values
+// outside the range are clamped (not rejected) so a UI passing an
+// out-of-bounds value still gets a useful response.
+const RUNS_LIMIT_DEFAULT = 30;
+const RUNS_LIMIT_MAX = 365;
+
+const RunsQuerySchema = z.object({
+  since: z.string().min(1).optional(),
+  limit: z
+    .string()
+    .optional()
+    .transform((s): number => {
+      if (s === undefined) return RUNS_LIMIT_DEFAULT;
+      const n = Number.parseInt(s, 10);
+      if (!Number.isFinite(n) || n <= 0) return RUNS_LIMIT_DEFAULT;
+      return Math.min(n, RUNS_LIMIT_MAX);
+    }),
+});
+
+interface HabitRunRow {
+  readonly id: string;
+  readonly fire_date: string;
+  readonly status: string;
+  readonly current_level: number;
+  readonly next_escalation_at: number | null;
+  readonly miss_reason: string | null;
+}
 
 export interface ApiDeps {
   readonly sessionStore: SessionStore;
@@ -130,6 +159,48 @@ export function buildApp(deps: ApiDeps): Hono {
       return c.json({ error: `unknown habit id: ${id}` }, 404);
     }
     return c.json(serializeHabit(row));
+  });
+
+  // GET /api/habits/:id/runs — paginated history of a habit's runs.
+  //
+  // `miss_reason` is left-joined from `miss_reasons` so a row missing
+  // a classification still surfaces (with `miss_reason: null`). When
+  // multiple miss_reasons exist for the same run (rare, but possible
+  // when an L3 retry overwrites the prior classification), the most
+  // recently inserted row wins via `MAX(created_at)`.
+  app.get("/api/habits/:id/runs", (c) => {
+    const id = c.req.param("id");
+    const parsed = RunsQuerySchema.safeParse({
+      since: c.req.query("since"),
+      limit: c.req.query("limit"),
+    });
+    if (!parsed.success) {
+      return c.json({ error: "invalid query parameters" }, 400);
+    }
+    const { since, limit } = parsed.data;
+
+    // The `miss_reasons` correlated subquery picks the latest classification
+    // per run. Using MAX(created_at) (rather than ORDER BY ... LIMIT 1)
+    // lets SQLite evaluate it as an aggregate against the per-run group.
+    const whereSince = since !== undefined ? "AND hr.fire_date >= ?" : "";
+    const stmt = deps.sessionStore.db.prepare(
+      `SELECT hr.id, hr.fire_date, hr.status, hr.current_level,
+              hr.next_escalation_at,
+              (SELECT mr.classification
+                 FROM miss_reasons mr
+                WHERE mr.run_id = hr.id
+                ORDER BY mr.created_at DESC
+                LIMIT 1) AS miss_reason
+         FROM habit_runs hr
+        WHERE hr.habit_id = ?
+          ${whereSince}
+        ORDER BY hr.fire_date DESC
+        LIMIT ?`,
+    );
+    const rows = (since !== undefined
+      ? stmt.all(id, since, limit)
+      : stmt.all(id, limit)) as ReadonlyArray<HabitRunRow>;
+    return c.json({ runs: rows });
   });
 
   return app;
