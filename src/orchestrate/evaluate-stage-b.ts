@@ -70,6 +70,7 @@ import {
   type WindDownCompletion,
 } from "./wins-poster.js";
 import { formatWindDownSummary } from "./reconcile-pending-runs.js";
+import { localDateString } from "../lib/local-date.js";
 
 // -----------------------------------------------------------------------------
 // Public API.
@@ -155,19 +156,6 @@ interface WindDownProofConfig {
 // -----------------------------------------------------------------------------
 // Local helpers.
 // -----------------------------------------------------------------------------
-
-/**
- * Format an epoch ms as YYYY-MM-DD in process local time. Mirrors the
- * `localDateString` helper in `src/lib/discord-adapter.ts` (Task 22's
- * fire_date convention).
- */
-function localDateString(epochMs: number): string {
-  const d = new Date(epochMs);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
 
 /** Format an epoch ms as HH:MM in process local time. */
 function localHHMM(epochMs: number): string {

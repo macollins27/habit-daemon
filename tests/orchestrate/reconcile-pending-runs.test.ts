@@ -38,19 +38,11 @@ const NOW_MS = 1_715_600_000_000;
 // Stubs: no-op async sensor + posting functions.
 // -----------------------------------------------------------------------------
 
-const noopConcept2Sync = async (_opts: {
-  habitId: string;
-  runId: string;
-  date: Date;
-}): Promise<void> => {
+const noopConcept2Sync = async (_date: string): Promise<void> => {
   // intentionally empty — skeleton stage
 };
 
-const noopGarminSync = async (_opts: {
-  habitId: string;
-  runId: string;
-  date: Date;
-}): Promise<void> => {
+const noopGarminSync = async (_date: string): Promise<void> => {
   // intentionally empty — skeleton stage
 };
 
@@ -182,6 +174,72 @@ describe("reconcilePendingRuns()", () => {
     expect(channelIds).toEqual(
       [SEED_CHANNELS.morningRow, "wins"].sort(),
     );
+  });
+
+  // ---------------------------------------------------------------------
+  // Followups Task 2.1: TZ local-vs-UTC test.
+  //
+  // The existing happy-path test runs at 15:00 UTC where local-date equals
+  // UTC-date in every common TZ, so the local-date code path isn't actually
+  // exercised. This test sets TZ to America/New_York and uses now = 02:00
+  // UTC = 22:00 local previous day, so local-date and UTC-date diverge. The
+  // reconciler must pick up the local-dated run, not the UTC-dated one.
+  // ---------------------------------------------------------------------
+  it("uses local date (not UTC) when filtering pending runs", async () => {
+    const originalTZ = process.env.TZ;
+    process.env.TZ = "America/New_York";
+    try {
+      const db = sessionStore.db;
+      const runId = "test-run-tz";
+      // 02:00 UTC on 2026-05-14 → 22:00 local 2026-05-13 in Eastern.
+      const nowMs = Date.parse("2026-05-14T02:00:00Z");
+
+      // Seed for local-date 2026-05-13. UTC-date for nowMs is 2026-05-14,
+      // so a reconciler using UTC would filter for '2026-05-14' and miss.
+      db.prepare(
+        `INSERT INTO habit_runs (
+           id, habit_id, fire_date, fired_at, current_level, next_escalation_at,
+           status, completed_at, proof_payload_json, skip_reason,
+           proof_rejection_callout_due
+         ) VALUES (?, 'morning-row', ?, ?, 1, NULL, 'pending', NULL, NULL, NULL, 0)`,
+      ).run(runId, "2026-05-13", nowMs - 60 * 60 * 1000);
+
+      db.prepare(
+        `INSERT INTO sensor_signals (id, source, payload_date, payload_json, fetched_at)
+         VALUES (?, 'concept2', '2026-05-13', ?, ?)`,
+      ).run(
+        "concept2-tz",
+        JSON.stringify({
+          results: [{
+            id: 9876,
+            date: "2026-05-13 09:00:00",
+            type: "rower",
+            duration_seconds: 700,
+            distance_meters: 2500,
+          }],
+        }),
+        nowMs,
+      );
+
+      const posts: Array<{ channelId: string }> = [];
+      const result = await reconcilePendingRuns({
+        sessionStore,
+        now: nowMs,
+        concept2Sync: async () => {},
+        garminSync: async () => {},
+        postCompletion: async (o) => void posts.push({ channelId: o.channelId }),
+      });
+
+      expect(result.attempted).toBe(1);
+      expect(result.completed).toBe(1);
+      const row = db
+        .prepare("SELECT status FROM habit_runs WHERE id = ?")
+        .get(runId) as { status: string };
+      expect(row.status).toBe("completed");
+    } finally {
+      if (originalTZ === undefined) delete process.env.TZ;
+      else process.env.TZ = originalTZ;
+    }
   });
 
   // ---------------------------------------------------------------------

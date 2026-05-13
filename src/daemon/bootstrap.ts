@@ -56,6 +56,7 @@ import {
   type Concept2Tokens,
 } from "../lib/concept2-adapter.js";
 import { syncDate as garminSyncDate } from "../lib/garmin-adapter.js";
+import { localDateString } from "../lib/local-date.js";
 import { createHabitRun } from "../orchestrate/create-habit-run.js";
 import { runHabitCheckin } from "../orchestrate/habit-checkin.js";
 import {
@@ -158,17 +159,6 @@ function registerHabitMorningCrons(db: Database.Database): number {
     inserted++;
   }
   return inserted;
-}
-
-/**
- * Local date (process timezone) as YYYY-MM-DD. Matches the convention used by
- * the cron parser (ADR 0001) and other verbs that compute "today" / "yesterday".
- */
-function localDateString(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
 }
 
 /**
@@ -321,15 +311,8 @@ export function makeInProcessDispatch(deps: DispatchDeps): DispatchFn {
         // which is the UTC date. To make the two keys agree, we pin the
         // Date at UTC midnight of the LOCAL date — that way the UTC slice
         // equals the local YYYY-MM-DD that fire_date uses. See ADR 0001.
-        const concept2Sync = async ({
-          date,
-        }: {
-          habitId: string;
-          runId: string;
-          date: Date;
-        }): Promise<void> => {
-          const localStr = localDateString(date);
-          const dateForSync = new Date(`${localStr}T00:00:00Z`);
+        const concept2Sync = async (date: string): Promise<void> => {
+          const dateForSync = new Date(`${date}T00:00:00Z`);
           await concept2SyncDate({
             db: deps.ledger.sessionStore.db,
             date: dateForSync,
@@ -342,19 +325,12 @@ export function makeInProcessDispatch(deps: DispatchDeps): DispatchFn {
           });
         };
         // Garmin's syncDate already takes a YYYY-MM-DD string. The
-        // reconciler hands us a Date — translate to the local date so
-        // sensor_signals.payload_date matches habit_runs.fire_date.
-        const garminSync = async ({
-          date,
-        }: {
-          habitId: string;
-          runId: string;
-          date: Date;
-        }): Promise<void> => {
-          const localStr = localDateString(date);
+        // reconciler hands us the local date directly — pass it through
+        // so sensor_signals.payload_date matches habit_runs.fire_date.
+        const garminSync = async (date: string): Promise<void> => {
           await garminSyncDate({
             db: deps.ledger.sessionStore.db,
-            date: localStr,
+            date,
             pythonBin: join(homedir(), ".habit-daemon", "venv", "bin", "python"),
           });
         };

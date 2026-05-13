@@ -18,6 +18,7 @@
 import type Database from "better-sqlite3";
 import type { Concept2Result } from "../lib/concept2-adapter.js";
 import { findQualifyingSession } from "./verify-proof-internals.js";
+import { parseMorningRowConfig } from "./proof-config.js";
 
 // -----------------------------------------------------------------------------
 // Public surface.
@@ -51,10 +52,6 @@ interface SensorPayloadRow {
 
 interface Concept2Payload {
   readonly results: readonly Concept2Result[];
-}
-
-interface MorningRowProofConfig {
-  readonly min_minutes: number;
 }
 
 // -----------------------------------------------------------------------------
@@ -125,16 +122,3 @@ function checkConcept2(
   };
 }
 
-function parseMorningRowConfig(
-  json: string,
-  habitId: string,
-): MorningRowProofConfig {
-  const parsed = JSON.parse(json) as Record<string, unknown>;
-  const minMinutes = parsed.min_minutes;
-  if (typeof minMinutes !== "number") {
-    throw new Error(
-      `habit ${habitId} proof_config_json missing numeric min_minutes`,
-    );
-  }
-  return { min_minutes: minMinutes };
-}

@@ -20,6 +20,11 @@
 import type Database from "better-sqlite3";
 import type { SessionStore } from "../daemon/session-store.js";
 import type { Concept2Result } from "../lib/concept2-adapter.js";
+import { localDateString } from "../lib/local-date.js";
+import {
+  parseMorningRowConfig,
+  parseWindDownConfig,
+} from "./proof-config.js";
 import { findQualifyingSession } from "./verify-proof-internals.js";
 import { ESCALATION_FOLLOW_UP_CONTENT } from "./habit-checkin.js";
 import { onsetBeyondThreshold } from "./evaluate-stage-b.js";
@@ -38,33 +43,28 @@ export interface ReconcileOptions {
   readonly sessionStore: SessionStore;
   readonly now: number;
   /**
-   * Refresh the Concept2 cache for the run's date. The wrapper MUST cause
-   * `sensor_signals` to be keyed by the run's local `fire_date` — the
-   * reconciler later reads `sensor_signals` using that local-date key.
+   * Refresh the Concept2 cache for the given local date (YYYY-MM-DD,
+   * process timezone). The wrapper MUST cause `sensor_signals` to be
+   * keyed by this same local-date string — the reconciler later reads
+   * `sensor_signals` using that key.
    *
    * The underlying adapter (`src/lib/concept2-adapter.ts:266 (toIsoDate)`)
-   * keys by UTC date. The wrapper must therefore translate `opts.date` to
-   * the local YYYY-MM-DD (see `localDateString` in this file) before
-   * calling the adapter, or the late-evening east-of-UTC case will miss
-   * freshly-synced data. See ADR 0001 for the local-time convention.
+   * keys by UTC date. The wrapper must therefore translate the local
+   * YYYY-MM-DD into a Date at UTC midnight before calling the adapter,
+   * or the late-evening east-of-UTC case will miss freshly-synced data.
+   * See ADR 0001 for the local-time convention.
+   *
+   * Signature aligns with `retry-unresolved-sensors.ts` so both sensor
+   * refresh paths share the same injection shape.
    */
-  readonly concept2Sync: (opts: {
-    habitId: string;
-    runId: string;
-    date: Date;
-  }) => Promise<void>;
+  readonly concept2Sync: (date: string) => Promise<void>;
   /**
-   * Refresh the Garmin cache for the run's date. Same TZ contract as
-   * `concept2Sync`: the wrapper MUST cause `sensor_signals` to be keyed
-   * by the run's local `fire_date`. If the underlying adapter keys by
-   * UTC (cf. `src/lib/concept2-adapter.ts:266 (toIsoDate)`), translate
-   * via `localDateString` before calling the adapter. See ADR 0001.
+   * Refresh the Garmin cache for the given local date (YYYY-MM-DD,
+   * process timezone). Same TZ contract as `concept2Sync`: the wrapper
+   * MUST cause `sensor_signals` to be keyed by this same local-date
+   * string.
    */
-  readonly garminSync: (opts: {
-    habitId: string;
-    runId: string;
-    date: Date;
-  }) => Promise<void>;
+  readonly garminSync: (date: string) => Promise<void>;
   readonly postCompletion: (opts: {
     channelId: string;
     runId: string;
@@ -75,19 +75,6 @@ export interface ReconcileOptions {
 // -----------------------------------------------------------------------------
 // Internal helpers.
 // -----------------------------------------------------------------------------
-
-// YYYY-MM-DD in process local time. Matches the daemon's `fire_date`
-// writer (ADR 0001: cron expressions are interpreted in local time).
-// Inlined here rather than imported from `discord-adapter.ts` because the
-// helper is private to four other modules already (bootstrap.ts,
-// discord-adapter.ts, evaluate-stage-b.ts, habit-checkin.ts); centralising
-// would be a separate refactor. See task report for rationale.
-function localDateString(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
 
 interface PendingRunRow {
   readonly id: string;
@@ -109,14 +96,6 @@ interface SensorPayloadRow {
 
 interface Concept2Payload {
   readonly results: readonly Concept2Result[];
-}
-
-interface MorningRowProofConfig {
-  readonly min_minutes: number;
-}
-
-interface WindDownProofConfig {
-  readonly stage_b_threshold: string;
 }
 
 interface GarminSleepPayload {
@@ -171,34 +150,6 @@ function loadCachedConcept2Results(
   }
   const parsed = JSON.parse(row.payload_json) as Concept2Payload;
   return parsed.results;
-}
-
-function parseMorningRowConfig(
-  json: string,
-  habitId: string,
-): MorningRowProofConfig {
-  const parsed = JSON.parse(json) as Record<string, unknown>;
-  const minMinutes = parsed.min_minutes;
-  if (typeof minMinutes !== "number") {
-    throw new Error(
-      `habit ${habitId} proof_config_json missing numeric min_minutes`,
-    );
-  }
-  return { min_minutes: minMinutes };
-}
-
-function parseWindDownConfig(
-  json: string,
-  habitId: string,
-): WindDownProofConfig {
-  const parsed = JSON.parse(json) as Record<string, unknown>;
-  const threshold = parsed.stage_b_threshold;
-  if (typeof threshold !== "string") {
-    throw new Error(
-      `habit ${habitId} proof_config_json missing stage_b_threshold string`,
-    );
-  }
-  return { stage_b_threshold: threshold };
 }
 
 /**
@@ -328,7 +279,7 @@ export async function reconcilePendingRuns(
       if (row.status !== "pending") continue;
 
       attempted += 1;
-      const didComplete = await reconcileConcept2Row(opts, row);
+      const didComplete = await reconcileConcept2Row(opts, row, today);
       if (didComplete) completed += 1;
     } else if (row.proof_type === "typed_msg+garmin_sleep") {
       // Wind-down accepts both `pending` (user has not typed
@@ -338,7 +289,7 @@ export async function reconcilePendingRuns(
       if (row.status !== "pending" && row.status !== "partial") continue;
 
       attempted += 1;
-      const didComplete = await reconcileWindDownRow(opts, row);
+      const didComplete = await reconcileWindDownRow(opts, row, today);
       if (didComplete) completed += 1;
     }
     // else: unknown proof_type — leave untouched, do not count.
@@ -363,17 +314,14 @@ export async function reconcilePendingRuns(
 async function reconcileConcept2Row(
   opts: ReconcileOptions,
   row: PendingRunRow,
+  today: string,
 ): Promise<boolean> {
   const db = opts.sessionStore.db;
 
   // Refresh the Concept2 cache. The injected sync function is async and
   // may throw; per design § 4 + Task 15, sync failures should surface
   // so the daemon's sensor-failure path can be wired in Task 1.4+.
-  await opts.concept2Sync({
-    habitId: row.habit_id,
-    runId: row.id,
-    date: new Date(opts.now),
-  });
+  await opts.concept2Sync(today);
 
   const results = loadCachedConcept2Results(db, row.fire_date);
   const config = parseMorningRowConfig(row.proof_config_json, row.habit_id);
@@ -404,14 +352,11 @@ async function reconcileConcept2Row(
 async function reconcileWindDownRow(
   opts: ReconcileOptions,
   row: PendingRunRow,
+  today: string,
 ): Promise<boolean> {
   const db = opts.sessionStore.db;
 
-  await opts.garminSync({
-    habitId: row.habit_id,
-    runId: row.id,
-    date: new Date(opts.now),
-  });
+  await opts.garminSync(today);
 
   const onset = loadGarminOnsetHHMM(db, row.fire_date);
   if (onset === undefined) return false;
