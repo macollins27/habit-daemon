@@ -21,6 +21,7 @@ import type Database from "better-sqlite3";
 import type { SessionStore } from "../daemon/session-store.js";
 import type { Concept2Result } from "../lib/concept2-adapter.js";
 import { findQualifyingSession } from "./verify-proof-internals.js";
+import { ESCALATION_FOLLOW_UP_CONTENT } from "./habit-checkin.js";
 
 // -----------------------------------------------------------------------------
 // Public surface (pinned in Task 1.1).
@@ -95,6 +96,10 @@ interface PendingRunRow {
   readonly channel_id: string;
   readonly proof_type: string;
   readonly proof_config_json: string;
+  // Phase 6.2: when non-null, the reconciler posts a brief follow-up to the
+  // source channel after autonomous closure so the orphaned escalation gets
+  // closure pointing at the #wins summary.
+  readonly last_escalation_message_id: string | null;
 }
 
 interface SensorPayloadRow {
@@ -139,7 +144,8 @@ function loadPendingRuns(
               r.status       AS status,
               h.channel_id   AS channel_id,
               h.proof_type   AS proof_type,
-              h.proof_config_json AS proof_config_json
+              h.proof_config_json AS proof_config_json,
+              r.last_escalation_message_id AS last_escalation_message_id
          FROM habit_runs r
          JOIN habits h ON h.id = r.habit_id
         WHERE r.status IN ('pending','partial')
@@ -443,12 +449,31 @@ async function reconcileWindDownRow(
  * wrapped in its own try/catch — the DB write is already committed and
  * a flaky channel must not prevent the sibling post or abort the batch.
  * Pattern mirrors `verify-proof.ts:670-682` (Stage-A wind-down ack).
+ *
+ * Phase 6.2: when the run carries a `last_escalation_message_id`, a brief
+ * follow-up is posted FIRST in the source channel so the orphaned
+ * escalation gets closure pointing at the closure summary that follows.
+ * The follow-up has its own try/catch and never blocks the closure posts.
  */
 async function postDualChannel(
   opts: ReconcileOptions,
   row: PendingRunRow,
   summary: string,
 ): Promise<void> {
+  if (row.last_escalation_message_id !== null) {
+    try {
+      await opts.postCompletion({
+        channelId: row.channel_id,
+        runId: row.id,
+        summary: ESCALATION_FOLLOW_UP_CONTENT,
+      });
+    } catch (err: unknown) {
+      console.error(
+        `[reconcile-pending-runs] escalation follow-up post failed for run ${row.id}`,
+        err,
+      );
+    }
+  }
   try {
     await opts.postCompletion({
       channelId: row.channel_id,

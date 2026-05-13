@@ -287,7 +287,23 @@ interface RunRowRaw {
   readonly current_level: number;
   readonly status: string;
   readonly proof_rejection_callout_due: number;
+  readonly last_escalation_message_id: string | null;
 }
+
+// -----------------------------------------------------------------------------
+// Phase 6.2: shared follow-up text for autonomous-close paths.
+//
+// When a run is closed by an autonomous path (reconciler, this short-circuit,
+// or handle-proof-message's applyCompleted) AND a prior escalation was tracked
+// (`habit_runs.last_escalation_message_id` is non-null), the daemon posts this
+// brief follow-up in the source channel so the orphaned escalation gets
+// closure pointing at the #wins summary that follows.
+//
+// Exported for cross-path consistency — all three call sites pass this exact
+// string to postToChannel, and the test suite asserts on the constant.
+// -----------------------------------------------------------------------------
+
+export const ESCALATION_FOLLOW_UP_CONTENT = "✓ Proof is in — see #wins.";
 
 // -----------------------------------------------------------------------------
 // Defensive guard helpers (Task 38).
@@ -659,7 +675,7 @@ export async function runHabitCheckin(
   const runRow = db
     .prepare(
       `SELECT id, habit_id, fire_date, fired_at, current_level, status,
-              proof_rejection_callout_due
+              proof_rejection_callout_due, last_escalation_message_id
          FROM habit_runs
         WHERE id = ?`,
     )
@@ -768,6 +784,25 @@ export async function runHabitCheckin(
     // Garmin branch is deferred). When that lands, this block becomes a
     // switch.
     if (provable.source === "concept2") {
+      // Phase 6.2: if a prior escalation was tracked for this run, post a
+      // brief follow-up FIRST so the orphaned escalation gets closure
+      // pointing at the #wins summary that follows. Its own try/catch — a
+      // flaky channel here must not block the closure summary posts below.
+      if (runRow.last_escalation_message_id !== null) {
+        try {
+          await postToChannel({
+            adapter: opts.adapter,
+            channel: habitRow.channel_id,
+            content: ESCALATION_FOLLOW_UP_CONTENT,
+          });
+        } catch (err: unknown) {
+          console.error(
+            `[habit-checkin] escalation follow-up post failed for run ${run.id}:`,
+            err,
+          );
+        }
+      }
+
       const summary = formatMorningRowSummary(
         provable.payload as unknown as Concept2Result,
       );
@@ -980,11 +1015,29 @@ export async function runHabitCheckin(
     domain: habit.domain,
     channel_id: habitRow.channel_id,
   });
-  await postImpl({
+  const postResult = await postImpl({
     adapter,
     channel: channelName,
     content: messageText,
   });
+
+  // Phase 6.1: record the Discord message id of this escalation so the
+  // completion path can post a follow-up referencing it when a later
+  // autonomous close supersedes the escalation. Fire-and-forget — wrap in
+  // try/catch so a stray DB error never tanks the verb. The post already
+  // succeeded; not recording the id only weakens the follow-up UX.
+  try {
+    db.prepare(
+      `UPDATE habit_runs
+          SET last_escalation_message_id = ?
+        WHERE id = ?`,
+    ).run(postResult.messageId, runId);
+  } catch (err: unknown) {
+    console.error(
+      `[habit-checkin] failed to record last_escalation_message_id for run ${runId}:`,
+      err,
+    );
+  }
 
   // ---------------------------------------------------------------------------
   // 7. Persist atomic state changes.
