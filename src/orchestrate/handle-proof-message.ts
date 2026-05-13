@@ -41,6 +41,7 @@ import {
 import { postWin, type Completion } from "./wins-poster.js";
 import { recordVisionRejection } from "./vision-rejection-counter.js";
 import type { VisionRejection } from "./vision-rejection-counter.js";
+import { postToChannel } from "../lib/discord-adapter.js";
 
 export interface HandleProofMessageOptions {
   readonly sessionStore: SessionStore;
@@ -129,6 +130,23 @@ export async function handleProofMessage(
   switch (result.outcome) {
     case "completed": {
       await applyCompleted(opts, result.proofPayload);
+      // Source-channel ack — fires even when buildCompletionForHabit returns
+      // null (the #wins post is skipped in that case, but the user still gets
+      // an in-channel "got it" so they aren't left wondering). Wrapped in an
+      // independent try/catch matching `verify-proof.ts:670-682` so a flaky
+      // channel post never blows up the rest of the handler.
+      try {
+        await postToChannel({
+          adapter: opts.adapter,
+          channel: opts.message.channelId,
+          content: "Got it — see #wins. ✓",
+        });
+      } catch (err: unknown) {
+        console.error(
+          `[handle-proof-message] source-channel completed-ack post failed for run ${opts.run.id}`,
+          err,
+        );
+      }
       return;
     }
     case "partial": {
@@ -138,11 +156,44 @@ export async function handleProofMessage(
     }
     case "rejected": {
       applyRejected(opts, result.proofPayload, result.reason);
+      try {
+        const reason = result.reason ?? "rejected by verifier";
+        await postToChannel({
+          adapter: opts.adapter,
+          channel: opts.message.channelId,
+          content: `That doesn't look right — ${reason}. Try again?`,
+        });
+      } catch (err: unknown) {
+        console.error(
+          `[handle-proof-message] source-channel rejected-ack post failed for run ${opts.run.id}`,
+          err,
+        );
+      }
       return;
     }
     case "pending":
     default: {
-      // No claim was made (no attachment / phrase mismatch / etc.). Wait.
+      // No claim was made (no attachment / phrase mismatch / etc.). Post a
+      // proof_type-tailored ack so the user knows the bot saw them and what
+      // it's still waiting on. If the habit row is somehow missing (shouldn't
+      // happen — we just dispatched on it via verifyProof), skip defensively.
+      try {
+        const habit = db
+          .prepare(`SELECT proof_type FROM habits WHERE id = ?`)
+          .get(opts.run.habit_id) as { proof_type: string } | undefined;
+        if (habit !== undefined) {
+          await postToChannel({
+            adapter: opts.adapter,
+            channel: opts.message.channelId,
+            content: pendingAckText(habit.proof_type),
+          });
+        }
+      } catch (err: unknown) {
+        console.error(
+          `[handle-proof-message] source-channel pending-ack post failed for run ${opts.run.id}`,
+          err,
+        );
+      }
       return;
     }
   }
@@ -290,4 +341,22 @@ function formatStrengthTime(d: Date): string {
   const ampm = d.getHours() >= 12 ? "pm" : "am";
   const m = String(d.getMinutes()).padStart(2, "0");
   return `${weekday ?? "?"} ${h12}:${m}${ampm}`;
+}
+
+/**
+ * Per-proof_type "I see your message, still waiting for proof" text. Used by
+ * the pending-outcome source-channel ack so the user knows the bot saw them
+ * and what specifically it's waiting on. Strings track `seed-habits.ts`.
+ */
+function pendingAckText(proofType: string): string {
+  switch (proofType) {
+    case "concept2_api+photo_fallback":
+      return "I see your message. Don't have proof yet — send a photo of the PM5 or finish the row and it'll sync automatically.";
+    case "typed_msg+garmin_sleep":
+      return "I see your message. Still waiting for either the trigger phrase ('shutting down', etc.) or the Garmin sleep data.";
+    case "training_log_photo":
+      return "I see your message. Send a photo of the training log to mark this done.";
+    default:
+      return "I see your message. Still need proof for this habit.";
+  }
 }
