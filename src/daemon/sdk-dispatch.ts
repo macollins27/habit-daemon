@@ -213,8 +213,15 @@ export function dispatchClaude(opts: DispatchOpts): DispatchResult {
     String(opts.maxBudgetUsd),
     "--allowedTools",
     opts.allowedTools.join(","),
+    // 2026-05-13: changed from "user,project" to "" — user-level skills like
+    // superpowers:using-superpowers auto-invoke on conversation start, consuming
+    // turn budget and producing error_max_turns before the model can compose the
+    // structured-output JSON. The habit-checkin + vision-verify prompts don't
+    // reference any skill, so empty setting sources is the correct surface here.
+    // If a future dispatch type needs skill resolution, add a settingSources opt
+    // to DispatchOpts and opt in explicitly.
     "--setting-sources",
-    "user,project",
+    "",
     "-p",
     opts.prompt,
   ];

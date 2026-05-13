@@ -25,6 +25,12 @@
         <string>/Users/maxwellcollins/.habit-daemon/heartbeat</string>
         <key>HABIT_STATE_DIR</key>
         <string>/Users/maxwellcollins/.habit-daemon</string>
+        <!-- launchd inherits a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin).
+             Extend it to find `claude` (~/.local/bin) and Homebrew node (claude
+             itself spawns node internally). Without this the daemon's
+             sdk-dispatch fails with "env: claude: No such file or directory". -->
+        <key>PATH</key>
+        <string>/Users/maxwellcollins/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <!-- Application env vars (ANTHROPIC_API_KEY, DISCORD_BOT_TOKEN, the
              5 DISCORD_CHANNEL_* ids) are loaded by bootstrap.ts from
              ~/.habit-daemon/env at process start. -->
