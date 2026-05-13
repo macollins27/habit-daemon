@@ -467,6 +467,44 @@ describe("Phase 6: escalation follow-up", () => {
     expect(posts[2]?.content).toMatch(/Morning row/);
   });
 
+  it("habit-checkin short-circuit skips follow-up when no escalation tracked", async () => {
+    // Symmetric pin: when last_escalation_message_id is NULL, the short-circuit
+    // must post only the standard dual-channel summary (2 posts), NOT the
+    // follow-up. Prevents a regression where the source-channel post double-
+    // posts (follow-up + summary) on first-tick wins.
+    seedHabitRun(db, {
+      runId: "run-sc-no-esc",
+      habitId: "morning-row",
+      currentLevel: 2,
+      lastEscalationMessageId: null,
+    });
+    seedQualifyingConcept2(db, FIRE_DATE);
+
+    const { adapter, posts } = buildAdapter();
+    const dispatchImpl = vi
+      .fn()
+      .mockRejectedValue(new Error("dispatch must not run"));
+    const postImpl = vi
+      .fn()
+      .mockRejectedValue(new Error("post must not run"));
+
+    await runHabitCheckin({
+      sessionStore,
+      adapter,
+      sessionId: SESSION_ID,
+      runId: "run-sc-no-esc",
+      currentLevel: 2,
+      now: NOW_MS,
+      dispatchImpl,
+      postImpl,
+    });
+
+    // Exactly 2 posts (source summary + wins summary). No follow-up.
+    expect(posts).toHaveLength(2);
+    expect(posts.every((p) => p.content !== ESCALATION_FOLLOW_UP_CONTENT)).toBe(true);
+    expect(posts.every((p) => /Morning row/.test(p.content))).toBe(true);
+  });
+
   // ---------------------------------------------------------------------------
   // 6.2c: handle-proof-message — follow-up REPLACES standard ack.
   // ---------------------------------------------------------------------------
