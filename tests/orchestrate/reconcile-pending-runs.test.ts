@@ -38,19 +38,11 @@ const NOW_MS = 1_715_600_000_000;
 // Stubs: no-op async sensor + posting functions.
 // -----------------------------------------------------------------------------
 
-const noopConcept2Sync = async (_opts: {
-  habitId: string;
-  runId: string;
-  date: Date;
-}): Promise<void> => {
+const noopConcept2Sync = async (_date: string): Promise<void> => {
   // intentionally empty — skeleton stage
 };
 
-const noopGarminSync = async (_opts: {
-  habitId: string;
-  runId: string;
-  date: Date;
-}): Promise<void> => {
+const noopGarminSync = async (_date: string): Promise<void> => {
   // intentionally empty — skeleton stage
 };
 
