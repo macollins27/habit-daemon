@@ -54,3 +54,38 @@ export type HabitCreate = z.infer<typeof HabitCreateInput>;
 export const HabitPatchInput = HabitCreateInput.partial();
 
 export type HabitPatch = z.infer<typeof HabitPatchInput>;
+
+/**
+ * Maps public API field names (HabitCreate / HabitPatch keys) to the actual
+ * `habits` table column names. Centralised here so that `createHabit`,
+ * `updateHabit`, and any future write path cannot drift from each other.
+ *
+ * - `slug` → `id` is the create-only mapping: `createHabit` writes
+ *   `id = "habit_" + slug`. `updateHabit` never sees `slug` in a patch
+ *   (the API contract does not allow renaming an id), so the `slug → id`
+ *   entry is unused on the update path; it is included here so the table
+ *   is canonical for the full HabitCreate keyspace.
+ * - JSON-typed columns (see `HABIT_JSON_COLUMNS` below) require
+ *   `JSON.stringify` on the value before binding; scalar columns bind
+ *   directly.
+ */
+export const HABIT_FIELD_TO_COLUMN: Readonly<Record<keyof HabitCreate, string>> =
+  {
+    slug: "id",
+    display_name: "name",
+    cadence: "cron_expr",
+    proof_type: "proof_type",
+    proof_config: "proof_config_json",
+    why_stakes: "why_stakes_json",
+    channel_id: "channel_id",
+  };
+
+/**
+ * Subset of HabitCreate keys whose values are JSON objects in the API
+ * contract and TEXT-encoded JSON in the database (`*_json` columns).
+ * Callers must `JSON.stringify` the raw value before binding.
+ */
+export const HABIT_JSON_COLUMNS: ReadonlySet<keyof HabitCreate> = new Set([
+  "proof_config",
+  "why_stakes",
+]);

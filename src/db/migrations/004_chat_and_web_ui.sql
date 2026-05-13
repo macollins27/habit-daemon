@@ -41,6 +41,13 @@ ALTER TABLE habits ADD COLUMN archived_at TEXT;
 -- 2. Rebuild session_events with the extended event_type CHECK list.
 --    The 16 pre-existing values must be preserved verbatim; the 6 new ones
 --    are appended at the end of the IN-list.
+--
+-- IMPORTANT: This CHECK list must stay in sync with:
+--   - SESSION_EVENT_TYPES (and the derived `SessionEventType` union +
+--     applySchema() CHECK clause) in src/daemon/session-store.ts.
+-- This migration is the canonical historical record for any pre-existing
+-- DB file; the TS-side const is the fresh-DB / migration-bypass guard used
+-- by tests that call `new SessionStore()` directly. Both must agree.
 CREATE TABLE session_events_new (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id    TEXT NOT NULL REFERENCES sessions(session_id),

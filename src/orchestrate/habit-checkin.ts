@@ -101,11 +101,20 @@ export function getEscalationDeltaMinutes(
 }
 
 // -----------------------------------------------------------------------------
-// Channel routing: habit.domain → ChannelName.
+// Channel routing: habit row → ChannelName | raw snowflake id.
 //
-// All three Phase A active habits each post to a dedicated channel. The map
-// is kept as a literal `Record<string, ChannelName>` so TypeScript flags
-// missing entries if a future habit ships without a channel.
+// Phase A seed habits (morning-row, strength-mwf, wind-down) have a `domain`
+// in the closed set below and route through the named-channel registry
+// (`adapter.channelIds[name]`). User-created habits (from `createHabit`) use
+// their slug as `domain` — not in the map — and carry the destination Discord
+// snowflake directly on `habits.channel_id`. For those rows we fall back to
+// the raw snowflake; `postToChannel` accepts `ChannelName | string` and
+// resolves either to a snowflake before calling `client.channels.fetch`.
+//
+// Why this matters: without the fallback, the first scheduler tick on any
+// user-created habit throws inside this verb because no DOMAIN_TO_CHANNEL
+// entry exists for arbitrary user slugs. The fallback is load-bearing for
+// chat/web-UI habit creation.
 // -----------------------------------------------------------------------------
 
 const DOMAIN_TO_CHANNEL: Readonly<Record<string, ChannelName>> = {
@@ -114,12 +123,31 @@ const DOMAIN_TO_CHANNEL: Readonly<Record<string, ChannelName>> = {
   "wind-down": "wind-down",
 };
 
-function channelForDomain(domain: string): ChannelName {
-  const name = DOMAIN_TO_CHANNEL[domain];
-  if (name === undefined) {
-    throw new Error(`No channel mapping for habit domain: ${domain}`);
+export interface ChannelRoutingHabit {
+  readonly domain: string;
+  readonly channel_id: string;
+}
+
+/**
+ * Resolve a habit row to the value that should be passed as
+ * `postToChannel.channel`. Phase-A seed habits return a `ChannelName` looked
+ * up via `DOMAIN_TO_CHANNEL`; user-created habits (any domain outside the
+ * closed map) return the raw `habit.channel_id` snowflake.
+ *
+ * Exported for regression-test coverage — production callers reach it
+ * implicitly through `runHabitCheckin`.
+ */
+export function channelForHabit(
+  habit: ChannelRoutingHabit,
+): ChannelName | string {
+  const name = DOMAIN_TO_CHANNEL[habit.domain];
+  if (name !== undefined) {
+    return name;
   }
-  return name;
+  // User-created habit (domain == slug, not in the Phase-A map). The row's
+  // `channel_id` IS the Discord snowflake — postToChannel passes it straight
+  // through to `client.channels.fetch`.
+  return habit.channel_id;
 }
 
 // -----------------------------------------------------------------------------
@@ -151,7 +179,12 @@ export type DispatchImpl = (opts: {
 
 export interface PostImplOptions {
   readonly adapter: DiscordAdapter;
-  readonly channel: ChannelName;
+  // `ChannelName` for Phase-A seed habits routed by name through
+  // `adapter.channelIds`; a raw Discord snowflake string for user-created
+  // habits whose `habits.channel_id` column carries the snowflake directly.
+  // See `channelForHabit` above and `postToChannel`'s resolver in
+  // `src/lib/discord-adapter.ts`.
+  readonly channel: ChannelName | string;
   readonly content: string;
 }
 
@@ -732,7 +765,10 @@ export async function runHabitCheckin(
   //    writes have happened — the run stays at its current level so the next
   //    scheduler tick retries.
   // ---------------------------------------------------------------------------
-  const channelName = channelForDomain(habit.domain);
+  const channelName = channelForHabit({
+    domain: habit.domain,
+    channel_id: habitRow.channel_id,
+  });
   await postImpl({
     adapter,
     channel: channelName,

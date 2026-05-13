@@ -17,7 +17,13 @@
  * transaction so a CHECK failure or audit-event failure rolls back the row.
  */
 
-import { HabitPatchInput, type HabitPatch } from "../api/schemas.js";
+import {
+  HabitPatchInput,
+  HABIT_FIELD_TO_COLUMN,
+  HABIT_JSON_COLUMNS,
+  type HabitCreate,
+  type HabitPatch,
+} from "../api/schemas.js";
 import { parseCronExpression } from "../daemon/cron-parser.js";
 import type { SessionStore } from "../daemon/session-store.js";
 
@@ -31,28 +37,14 @@ interface HabitExistsRow {
   readonly id: string;
 }
 
-// API field name → habits column name. Object-valued fields are JSON-encoded
-// into a `_json` column; scalar fields go to the column whose name appears
-// in the value here. Anything not in this map is treated as a passthrough
-// (column name equals API field name).
-const FIELD_TO_COLUMN: ReadonlyMap<keyof HabitPatch, string> = new Map([
-  ["display_name", "name"],
-  ["cadence", "cron_expr"],
-  ["proof_config", "proof_config_json"],
-  ["why_stakes", "why_stakes_json"],
-  ["proof_type", "proof_type"],
-  ["channel_id", "channel_id"],
-]);
-
-// API fields whose value is an object and must be JSON.stringify'd before
-// going to SQLite. Scalar fields bypass this.
-const JSON_FIELDS: ReadonlySet<keyof HabitPatch> = new Set([
-  "proof_config",
-  "why_stakes",
-]);
-
+// The API → DB column mapping and JSON-column set are imported from
+// `src/api/schemas.ts` so `createHabit`, `updateHabit`, and any future write
+// path agree on one source of truth. `slug` appears in HABIT_FIELD_TO_COLUMN
+// (mapping to `id`) but is rejected on the update path below because slugs
+// are immutable — the create-only key is left in the shared table so the
+// constant is canonical for the full HabitCreate keyspace.
 function isJsonField(key: keyof HabitPatch): boolean {
-  return JSON_FIELDS.has(key);
+  return HABIT_JSON_COLUMNS.has(key);
 }
 
 export function updateHabit(opts: UpdateHabitOptions): void {
@@ -94,7 +86,12 @@ export function updateHabit(opts: UpdateHabitOptions): void {
     const setters: string[] = [];
     const params: unknown[] = [];
     for (const key of changedFields) {
-      const column = FIELD_TO_COLUMN.get(key);
+      // `slug` is a HabitCreate-only key (immutable on update). Reject loud
+      // rather than silently translating to UPDATE habits SET id = ?.
+      if (key === "slug") {
+        throw new Error("slug is immutable; cannot be updated");
+      }
+      const column = HABIT_FIELD_TO_COLUMN[key as keyof HabitCreate];
       if (column === undefined) {
         // Should be unreachable because Zod stripped unknown keys, but
         // fail loudly rather than silently ignoring.

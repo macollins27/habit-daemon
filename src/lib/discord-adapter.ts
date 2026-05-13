@@ -179,9 +179,21 @@ export interface AttachmentSpec {
   readonly description?: string;
 }
 
+/**
+ * `channel` accepts either:
+ *   - a known `ChannelName` (Phase A seed channels resolved through
+ *     `adapter.channelIds`), or
+ *   - a raw Discord snowflake ID (any other string) for user-created habits
+ *     whose `channel_id` is configured directly on the row.
+ *
+ * The resolver below tries the registry lookup first; if the value isn't a
+ * registered name, it is passed verbatim to `client.channels.fetch`. This
+ * keeps Phase-A seed habits routing through the named registry while letting
+ * user-created habits supply a snowflake without invent a name for it.
+ */
 export interface PostToChannelOptions {
   readonly adapter: DiscordAdapter;
-  readonly channel: ChannelName;
+  readonly channel: ChannelName | string;
   readonly content: string;
   readonly attachments?: readonly AttachmentSpec[];
 }
@@ -216,14 +228,17 @@ export async function postToChannel(
 ): Promise<PostResult> {
   const { adapter, channel, content, attachments } = opts;
 
-  // Runtime guard mirroring the compile-time `ChannelName` union: callers
-  // that bypass typing (e.g. dynamic dispatch with a string from config)
-  // still get a loud failure instead of a silent post to the wrong place.
-  if (!isChannelNameKnown(adapter.channelIds, channel)) {
-    throw new Error(`Unknown Discord channel name: "${channel}"`);
-  }
-
-  const channelId = adapter.channelIds[channel];
+  // Resolve the snowflake id. Two paths:
+  //   1. `channel` is a registered ChannelName — look up the snowflake in
+  //      `adapter.channelIds`. Phase-A seed habits take this path.
+  //   2. `channel` is anything else — treat as a raw snowflake id and pass
+  //      verbatim to `client.channels.fetch`. User-created habits (whose
+  //      `habits.channel_id` column is the snowflake itself) take this path.
+  // Either way the fetched channel must be text-based; non-text channels
+  // fail loud below regardless of how we resolved the id.
+  const channelId = isChannelNameKnown(adapter.channelIds, channel)
+    ? adapter.channelIds[channel]
+    : channel;
 
   const fetched = await adapter.client.channels.fetch(channelId);
   if (fetched === null) {
