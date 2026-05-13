@@ -33,6 +33,33 @@ import { computeStats, type HabitRunForStats } from "./stats.js";
 const RUNS_LIMIT_DEFAULT = 30;
 const RUNS_LIMIT_MAX = 365;
 
+// Bounded limit for the /activity endpoint. Default 100, max 500.
+const ACTIVITY_LIMIT_DEFAULT = 100;
+const ACTIVITY_LIMIT_MAX = 500;
+
+const ActivityQuerySchema = z.object({
+  before: z.string().min(1).optional(),
+  limit: z
+    .string()
+    .optional()
+    .transform((s): number => {
+      if (s === undefined) return ACTIVITY_LIMIT_DEFAULT;
+      const n = Number.parseInt(s, 10);
+      if (!Number.isFinite(n) || n <= 0) return ACTIVITY_LIMIT_DEFAULT;
+      return Math.min(n, ACTIVITY_LIMIT_MAX);
+    }),
+});
+
+interface ActivityEventRow {
+  readonly id: number;
+  readonly session_id: string;
+  readonly seq: number;
+  readonly event_json: string;
+  readonly event_type: string | null;
+  readonly trust_level: string;
+  readonly written_iso: string;
+}
+
 const RunsQuerySchema = z.object({
   since: z.string().min(1).optional(),
   limit: z
@@ -225,6 +252,41 @@ export function buildApp(deps: ApiDeps): Hono {
       )
       .all(id) as ReadonlyArray<HabitRunForStats>;
     return c.json(computeStats(rows));
+  });
+
+  // GET /api/activity — cursor-paginated recent-activity feed.
+  //
+  // Cursor: `written_iso` of the last event in the response. The next
+  // request passes it as `?before=<written_iso>` to fetch the next
+  // older page. `next_cursor` is null when the page is short (i.e. we
+  // returned fewer rows than the requested limit), signalling the end
+  // of the feed.
+  //
+  // The index `idx_session_events_written_iso_desc` (migration 004)
+  // makes the descending sort O(limit) without a sort step.
+  app.get("/api/activity", (c) => {
+    const parsed = ActivityQuerySchema.safeParse({
+      before: c.req.query("before"),
+      limit: c.req.query("limit"),
+    });
+    if (!parsed.success) {
+      return c.json({ error: "invalid query parameters" }, 400);
+    }
+    const { before, limit } = parsed.data;
+    const whereBefore = before !== undefined ? "WHERE written_iso < ?" : "";
+    const stmt = deps.sessionStore.db.prepare(
+      `SELECT id, session_id, seq, event_json, event_type, trust_level, written_iso
+         FROM session_events
+         ${whereBefore}
+        ORDER BY written_iso DESC
+        LIMIT ?`,
+    );
+    const rows = (before !== undefined
+      ? stmt.all(before, limit)
+      : stmt.all(limit)) as ReadonlyArray<ActivityEventRow>;
+    const nextCursor =
+      rows.length < limit ? null : (rows[rows.length - 1]?.written_iso ?? null);
+    return c.json({ events: rows, next_cursor: nextCursor });
   });
 
   return app;
