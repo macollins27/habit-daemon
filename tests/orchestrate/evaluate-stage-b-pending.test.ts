@@ -486,6 +486,39 @@ describe("evaluateStageB() pending-path autonomy", () => {
     expect(pendingAck.calls).toHaveLength(0);
   });
 
+  it("leaves a pending wind-down run pending when Garmin onset is post-midnight (after threshold)", async () => {
+    // Regression pin for the wrap-around bug: naive lex compare "01:25" < "23:00"
+    // is true, but going to sleep at 1:25 AM is past a 23:00 threshold.
+    // onsetBeyondThreshold must treat onsets before 12:00 as post-midnight.
+    const runId = "run-pending-post-midnight";
+    seedHabitRun(harness.db, { runId, status: "pending" });
+    seedGarminSignal(harness.db, YESTERDAY_DATE, `${YESTERDAY_DATE}T01:25:00`);
+
+    const post = makeRecordingPostImpl();
+    const wins = makeRecordingWinsImpl();
+    const pendingAck = makeRecordingPendingAckImpl();
+
+    const result = await evaluateStageB({
+      sessionStore: harness.sessionStore,
+      adapter: harness.adapter,
+      sessionId: SESSION_ID,
+      now: NOW_MS,
+      postImpl: post.impl,
+      winsPostImpl: wins.impl,
+      pendingAckPostImpl: pendingAck.impl,
+    });
+
+    expect(result.attempted).toBe(1);
+    expect(result.completed).toBe(0);
+    expect(result.stillPending).toBe(1);
+
+    const run = readRun(harness.db, runId);
+    expect(run?.status).toBe("pending");
+    expect(run?.completed_at).toBeNull();
+    expect(readStages(harness.db, runId)).toHaveLength(0);
+    expect(pendingAck.calls).toHaveLength(0);
+  });
+
   it("leaves a pending wind-down run untouched and counts noData when no Garmin row exists", async () => {
     const runId = "run-pending-no-data";
     seedHabitRun(harness.db, { runId, status: "pending" });

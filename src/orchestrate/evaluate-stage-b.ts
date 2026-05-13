@@ -184,6 +184,33 @@ function hhmmToMinutes(hhmm: string): number {
 }
 
 /**
+ * Decide whether a Garmin sleep onset is past the wind-down threshold.
+ *
+ * Naive `onset > threshold` lex compare on HH:MM strings handles same-side-of-
+ * midnight cases correctly ("22:30" < "23:00", "23:30" > "23:00") but fails
+ * for post-midnight bedtimes: "01:25" < "23:00" lexically, but going to sleep
+ * at 1:25 AM is clearly past a 23:00 threshold. Garmin onsets in production
+ * are post-midnight more often than not.
+ *
+ * Fix: convert to minutes-from-midnight and treat any onset before 12:00 as
+ * post-midnight by adding 1440 (a full day). The wind-down window is the
+ * evening-into-next-morning — no user is going to sleep at noon, so 12:00 is
+ * a safe split point.
+ *
+ * Examples:
+ *   onset="22:30", threshold="23:00" → 1350 vs 1380 → not beyond ✓
+ *   onset="23:30", threshold="23:00" → 1410 vs 1380 → beyond ✓
+ *   onset="01:25", threshold="23:00" → 1525 (post-midnight +1440) vs 1380 → beyond ✓
+ *   onset="00:30", threshold="22:00" → 1470 vs 1320 → beyond ✓
+ */
+export function onsetBeyondThreshold(onset: string, threshold: string): boolean {
+  const rawOnset = hhmmToMinutes(onset);
+  const threshMin = hhmmToMinutes(threshold);
+  const adjustedOnset = rawOnset < 12 * 60 ? rawOnset + 1440 : rawOnset;
+  return adjustedOnset > threshMin;
+}
+
+/**
  * Compute minutes elapsed between stage A and stage B in HH:MM-from-midnight
  * arithmetic. If the difference is negative (e.g., stage A at 23:55 and
  * stage B onset at 00:10), add 1440 — the user crossed midnight, which is
@@ -561,7 +588,7 @@ export async function evaluateStageB(
       // Onset > threshold leaves the row pending (the user may still type
       // "shutting down" later; the miss-transition lives in the partial
       // path after stage A lands). Onset ≤ threshold autonomously completes.
-      if (onset > threshold) {
+      if (onsetBeyondThreshold(onset, threshold)) {
         stillPending += 1;
         continue;
       }
@@ -613,8 +640,10 @@ export async function evaluateStageB(
     // applyCompleted / applyMissed helpers with stage A timing.
     const stageATime = localHHMM(stageAEpoch);
 
-    // Lexicographic comparison is equivalent to time comparison on zero-padded HH:MM.
-    if (onset <= threshold) {
+    // onsetBeyondThreshold handles post-midnight bedtimes correctly — naive
+    // lex compare on HH:MM treats "01:25" < "23:00" as true, but 1:25 AM is
+    // past a 23:00 threshold.
+    if (!onsetBeyondThreshold(onset, threshold)) {
       const ctx: ResolutionContext = {
         sessionStore: opts.sessionStore,
         sessionId: opts.sessionId,

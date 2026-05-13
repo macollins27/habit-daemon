@@ -6,6 +6,8 @@ habit-state.db*
 ~/.habit-daemon/
 .DS_Store
 *.log
+__pycache__/
+*.pyc
 docs/*
 !docs/decisions/
 !docs/decisions/**

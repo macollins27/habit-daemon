@@ -439,6 +439,52 @@ describe("reconcilePendingRuns()", () => {
     expect(posts).toHaveLength(0);
   });
 
+  it("leaves a pending wind-down run pending when Garmin onset is post-midnight", async () => {
+    // Regression pin: naive lex compare "01:25" < "23:00" returns true, but
+    // bedtime at 1:25 AM is past a 23:00 threshold. onsetBeyondThreshold
+    // must treat onsets before 12:00 as post-midnight.
+    const db = sessionStore.db;
+    const runId = "test-run-windown-post-midnight";
+    const fireDate = "2026-05-13";
+    const nowMs = Date.parse("2026-05-13T15:00:00Z");
+
+    db.prepare(
+      `INSERT INTO habit_runs (
+         id, habit_id, fire_date, fired_at, current_level, next_escalation_at,
+         status, completed_at, proof_payload_json, skip_reason,
+         proof_rejection_callout_due
+       ) VALUES (?, 'wind-down', ?, ?, 1, NULL, 'pending', NULL, NULL, NULL, 0)`,
+    ).run(runId, fireDate, Date.parse("2026-05-13T22:00:00Z"));
+
+    db.prepare(
+      `INSERT INTO sensor_signals (id, source, payload_date, payload_json, fetched_at)
+       VALUES (?, 'garmin', ?, ?, ?)`,
+    ).run("garmin-2026-05-13", fireDate, JSON.stringify({
+      sleep: { sleep_onset_time: "2026-05-13T01:25:00" },
+    }), nowMs);
+
+    const posts: Array<{ channelId: string; summary: string }> = [];
+    const result = await reconcilePendingRuns({
+      sessionStore,
+      now: nowMs,
+      concept2Sync: async () => {},
+      garminSync: async () => {},
+      postCompletion: async (o) =>
+        void posts.push({ channelId: o.channelId, summary: o.summary }),
+    });
+
+    expect(result.attempted).toBe(1);
+    expect(result.completed).toBe(0);
+    expect(result.stillPending).toBe(1);
+
+    const updated = db
+      .prepare("SELECT status, completed_at FROM habit_runs WHERE id = ?")
+      .get(runId) as { status: string; completed_at: number | null };
+    expect(updated.status).toBe("pending");
+    expect(updated.completed_at).toBeNull();
+    expect(posts).toHaveLength(0);
+  });
+
   it("completes a partial wind-down run when Garmin onset is at or before threshold", async () => {
     // This is the headline scenario for Task 1.3: the daemon already
     // observed the "shutting down" typed message (status='partial') and
