@@ -243,7 +243,7 @@ function formatWindDownSummary(onset: string, threshold: string): string {
  *
  * Example: `✓ Morning row · 2026-05-13 09:35:00 · 10:03 · 2279m`.
  */
-function formatMorningRowSummary(session: Concept2Result): string {
+export function formatMorningRowSummary(session: Concept2Result): string {
   const totalSeconds = Math.floor(session.duration_seconds);
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;

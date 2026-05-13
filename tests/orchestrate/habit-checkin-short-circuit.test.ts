@@ -269,7 +269,7 @@ describe("runHabitCheckin() short-circuit on proof-in-cache", () => {
     });
     const session = seedQualifyingConcept2(db, TODAY_DATE);
 
-    const { adapter } = buildAdapter();
+    const { adapter, mockSend, mockFetch } = buildAdapter();
     const dispatchImpl = vi
       .fn()
       .mockRejectedValue(new Error("dispatch must not run"));
@@ -297,11 +297,49 @@ describe("runHabitCheckin() short-circuit on proof-in-cache", () => {
     });
 
     expect(dispatchImpl).not.toHaveBeenCalled();
+    // The injected `postImpl` is for the L1-L5 message path. The short-circuit
+    // posts the dual-channel ack via `postToChannel` directly (matching the
+    // reconciler), so `postImpl` must remain untouched.
     expect(postImpl).not.toHaveBeenCalled();
 
     const row = getRun(db, "run-mr-shortcircuit");
     expect(row?.status).toBe("completed");
     expect(row?.completed_at).toBe(NOW_MS);
+    // Audit trail mirrors the reconciler's writeCompletion: nullable
+    // next_escalation_at + proof_payload_json envelope.
+    expect(row?.next_escalation_at).toBeNull();
+    const fullRow = db
+      .prepare(
+        `SELECT proof_payload_json FROM habit_runs WHERE id = ?`,
+      )
+      .get("run-mr-shortcircuit") as { proof_payload_json: string | null };
+    expect(fullRow.proof_payload_json).toBe(
+      JSON.stringify({
+        proof: {
+          source: "concept2",
+          session,
+          autoDetected: true,
+        },
+      }),
+    );
+
+    // Dual-channel post mirrors the reconciler: source channel
+    // (morning-row snowflake) + #wins, each with the
+    // `formatMorningRowSummary` content.
+    const expectedSummary = `✓ Morning row · ${session.date} · 12:00 · ${session.distance_meters}m`;
+    expect(mockSend).toHaveBeenCalledTimes(2);
+    expect(mockSend).toHaveBeenNthCalledWith(1, {
+      content: expectedSummary,
+      files: [],
+    });
+    expect(mockSend).toHaveBeenNthCalledWith(2, {
+      content: expectedSummary,
+      files: [],
+    });
+    // First fetch resolves the source-channel snowflake (raw habit.channel_id);
+    // second resolves the "wins" ChannelName via the adapter's channelIds map.
+    expect(mockFetch).toHaveBeenNthCalledWith(1, CHANNEL_IDS["morning-row"]);
+    expect(mockFetch).toHaveBeenNthCalledWith(2, CHANNEL_IDS.wins);
 
     const events = getSessionEvents(db, SESSION_ID);
     const completedEvents = events.filter(
@@ -390,7 +428,7 @@ describe("runHabitCheckin() short-circuit on proof-in-cache", () => {
     });
     seedQualifyingConcept2(db, TODAY_DATE);
 
-    const { adapter } = buildAdapter();
+    const { adapter, mockSend } = buildAdapter();
     const dispatchImpl = vi
       .fn()
       .mockRejectedValue(new Error("dispatch must not run"));
@@ -415,7 +453,11 @@ describe("runHabitCheckin() short-circuit on proof-in-cache", () => {
     expect(result.nextEscalationAt).toBeNull();
 
     expect(dispatchImpl).not.toHaveBeenCalled();
+    // The L1-L5 postImpl is NOT used by the short-circuit; the dual-channel
+    // ack goes through `postToChannel` directly. Verify that explicitly.
     expect(postImpl).not.toHaveBeenCalled();
+    // Two dual-channel posts (source + #wins) still happen on short-circuit.
+    expect(mockSend).toHaveBeenCalledTimes(2);
 
     const row = getRun(db, "run-mr-today");
     expect(row?.status).toBe("completed");
