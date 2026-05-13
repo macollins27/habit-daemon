@@ -36,12 +36,14 @@ import { runMigrations } from "../db/migrate.js";
 import { loadMigrations } from "../db/load-migrations.js";
 import { seedHabits } from "../db/seed-habits.js";
 import {
+  catchUpOnStartup,
   createDiscordAdapter,
   loadDiscordBotTokenFromEnv,
   loadDiscordChannelIdsFromEnv,
   postToChannel,
   subscribeMessages,
   type DiscordAdapter,
+  type MessageMatch,
 } from "../lib/discord-adapter.js";
 import { dispatchClaude } from "./sdk-dispatch.js";
 import { parseClaudeEnvelope } from "./verify-footer.js";
@@ -501,40 +503,71 @@ export async function bootstrap(): Promise<BootstrapResult> {
     concept2: safeConcept2,
   });
 
+  // Single handler body shared between the bootstrap catch-up sweep
+  // (Phase 5) and the live messageCreate listener so the two paths cannot
+  // drift. Both call sites pass it through to {catchUpOnStartup,
+  // subscribeMessages}; both expect a (match) => Promise<void> shape.
+  const handleMatch = async (match: MessageMatch): Promise<void> => {
+    try {
+      await handleProofMessage({
+        sessionStore: ledger.sessionStore,
+        adapter,
+        sessionId,
+        run: match.run,
+        message: match.message,
+        channelName: match.channelName,
+        now: Date.now(),
+        concept2:
+          concept2 !== null
+            ? {
+                credentials: concept2.credentials,
+                tokens: concept2.tokens,
+                onTokensRefreshed: (newTokens) => {
+                  concept2!.tokens = newTokens;
+                  saveConcept2Tokens(newTokens);
+                },
+              }
+            : null,
+        visionDispatchImpl: dispatchClaudeForCheckin,
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      logErr(`handleProofMessage exception: ${msg}`);
+    }
+  };
+
+  // Phase 5: catch-up sweep. After Discord is ready and BEFORE the live
+  // listener is wired, fetch recent messages from each active channel and
+  // replay anything newer than the persisted cursor. This closes the gap
+  // where a daemon restart drops messageCreate events delivered during the
+  // restart window. Failures are logged + skipped per-channel; the sweep
+  // never propagates an error that would crash bootstrap.
+  try {
+    const catchUpResult = await catchUpOnStartup({
+      adapter,
+      db,
+      handler: handleMatch,
+    });
+    logInfo(
+      `discord catch-up: ${catchUpResult.perChannel
+        .map(
+          (r) =>
+            `${r.channelName}=fetched:${String(r.fetched)} replayed:${String(r.replayed)} skipped:${String(r.skipped)}`,
+        )
+        .join("; ")}`,
+    );
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logErr(`discord catch-up failed (continuing bootstrap): ${msg}`);
+  }
+
   // Wire the Discord listener to the proof-message handler. This subscription
   // lasts the lifetime of the daemon process; the returned unsubscribe is
   // exposed via cleanup() so SIGTERM tears it down cleanly.
   const unsubscribe = subscribeMessages({
     adapter,
     db,
-    handler: async (match): Promise<void> => {
-      try {
-        await handleProofMessage({
-          sessionStore: ledger.sessionStore,
-          adapter,
-          sessionId,
-          run: match.run,
-          message: match.message,
-          channelName: match.channelName,
-          now: Date.now(),
-          concept2:
-            concept2 !== null
-              ? {
-                  credentials: concept2.credentials,
-                  tokens: concept2.tokens,
-                  onTokensRefreshed: (newTokens) => {
-                    concept2!.tokens = newTokens;
-                    saveConcept2Tokens(newTokens);
-                  },
-                }
-              : null,
-          visionDispatchImpl: dispatchClaudeForCheckin,
-        });
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        logErr(`handleProofMessage exception: ${msg}`);
-      }
-    },
+    handler: handleMatch,
   });
   logInfo(`discord listener subscribed`);
 

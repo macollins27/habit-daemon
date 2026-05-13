@@ -366,6 +366,19 @@ function localDateString(now: Date): string {
   return `${y}-${m}-${d}`;
 }
 
+// SQL for the single-row active-run lookup keyed by (channel_id, fire_date).
+// Single source of truth for both the live listener (subscribeMessages) and
+// the bootstrap catch-up sweep (catchUpOnStartup) so the two paths cannot
+// drift in their matching semantics.
+const LOOKUP_ACTIVE_RUN_SQL =
+  `SELECT id, habit_id, fire_date, current_level, status,
+          proof_rejection_callout_due
+     FROM habit_runs
+    WHERE habit_id = (SELECT id FROM habits WHERE channel_id = ?)
+      AND fire_date = ?
+      AND status IN ('pending', 'partial')
+    LIMIT 1`;
+
 export function subscribeMessages(opts: SubscribeMessagesOptions): Unsubscribe {
   const { adapter, db, handler } = opts;
   const nowFn = opts.now ?? (() => new Date());
@@ -375,15 +388,7 @@ export function subscribeMessages(opts: SubscribeMessagesOptions): Unsubscribe {
   // Single-row lookup. Joining channel_id → habit_id inline keeps the
   // listener stateless: no in-memory cache of habit rows to keep coherent
   // with schema changes (Phase B plan-change pipeline).
-  const lookupRun = db.prepare(
-    `SELECT id, habit_id, fire_date, current_level, status,
-            proof_rejection_callout_due
-       FROM habit_runs
-      WHERE habit_id = (SELECT id FROM habits WHERE channel_id = ?)
-        AND fire_date = ?
-        AND status IN ('pending', 'partial')
-      LIMIT 1`,
-  );
+  const lookupRun = db.prepare(LOOKUP_ACTIVE_RUN_SQL);
 
   const onMessage = (msg: Message): void => {
     // Diagnostic logging — every observed messageCreate is logged with the
@@ -396,6 +401,28 @@ export function subscribeMessages(opts: SubscribeMessagesOptions): Unsubscribe {
         `content_len=${msg.content?.length ?? 0} ` +
         `attachments=${msg.attachments?.size ?? 0}\n`,
     );
+
+    // Phase 5: advance the per-channel cursor on EVERY observed message
+    // (before bot / active-channel / lookup-run skips). The cursor is the
+    // "last thing we saw" signal used by the bootstrap catch-up sweep to
+    // decide what to replay after a restart; it is independent of whether
+    // the handler ends up processing the message. better-sqlite3 is sync,
+    // so this commits before the (async) handler can race. Failures here
+    // are best-effort: log and continue, never block live message handling.
+    try {
+      const createdIso = (
+        msg.createdAt instanceof Date ? msg.createdAt : new Date()
+      ).toISOString();
+      db.prepare(
+        `INSERT OR REPLACE INTO discord_channel_cursors (channel_id, last_seen_iso, updated_at)
+         VALUES (?, ?, ?)`,
+      ).run(msg.channelId, createdIso, Date.now());
+    } catch (err: unknown) {
+      console.error(
+        `[discord-listener] cursor write failed for channel ${msg.channelId}:`,
+        err,
+      );
+    }
 
     // discord.js's Message.author can be null in exotic webhook cases. The
     // optional chain plus `?? false` collapses both "no author" and
@@ -454,4 +481,226 @@ export function subscribeMessages(opts: SubscribeMessagesOptions): Unsubscribe {
   return () => {
     adapter.client.off("messageCreate", onMessage);
   };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: bootstrap catch-up sweep.
+//
+// When the daemon process restarts (e.g. on a code deploy or launchd reload),
+// any Discord messageCreate events delivered during the restart window are
+// lost — discord.js does not buffer events across process lifetimes. The
+// catch-up sweep closes that gap: on bootstrap, after the Discord client is
+// `ready` but before the live `subscribeMessages` listener is wired up, fetch
+// recent messages from each active channel and replay any whose `createdAt`
+// is newer than the per-channel cursor through the same handler the live
+// listener will use.
+//
+// Invariants (mirrored from subscribeMessages.onMessage so the two paths stay
+// behaviourally identical):
+//   - The cursor advances on every observed message, regardless of whether
+//     the handler ran.
+//   - Bot-authored messages are skipped.
+//   - A message only triggers `handler` if there is a pending/partial
+//     habit_runs row for today on the channel's habit.
+//   - Per-channel errors are logged and swallowed: a fetch failure on one
+//     channel must not abort the whole sweep, and must not crash bootstrap.
+//   - Replay order is chronological (oldest first) so the handler sees the
+//     same ordering it would see live.
+// ---------------------------------------------------------------------------
+
+export interface CatchUpChannelResult {
+  readonly channelName: ChannelName;
+  readonly fetched: number;
+  readonly replayed: number;
+  readonly skipped: number;
+}
+
+export interface CatchUpResult {
+  readonly perChannel: ReadonlyArray<CatchUpChannelResult>;
+}
+
+export interface CatchUpOptions {
+  readonly adapter: DiscordAdapter;
+  readonly db: Database.Database;
+  readonly handler: (match: MessageMatch) => Promise<void> | void;
+  /** Injectable clock for tests. Defaults to `() => new Date()`. */
+  readonly now?: () => Date;
+  /** Max messages to fetch per channel. Default 50. */
+  readonly limit?: number;
+}
+
+// Narrow shape of the discord.js TextBasedChannel surface we touch. We avoid
+// importing the wide channel union from discord.js because `channels.fetch`
+// returns `Channel | null` and requires `isTextBased()` narrowing to read
+// `.messages`. The shape below is the minimum the sweep needs.
+interface FetchableMessagesChannel {
+  readonly isTextBased: () => boolean;
+  readonly messages: {
+    readonly fetch: (opts: {
+      readonly limit: number;
+    }) => Promise<Map<string, Message> | { readonly values: () => Iterable<Message> }>;
+  };
+}
+
+function isFetchableMessagesChannel(c: unknown): c is FetchableMessagesChannel {
+  if (c === null || typeof c !== "object") return false;
+  const obj = c as { isTextBased?: unknown; messages?: unknown };
+  if (typeof obj.isTextBased !== "function") return false;
+  if (typeof obj.messages !== "object" || obj.messages === null) return false;
+  const msgs = obj.messages as { fetch?: unknown };
+  return typeof msgs.fetch === "function";
+}
+
+function writeCursor(
+  db: Database.Database,
+  channelId: string,
+  createdAt: Date,
+): void {
+  try {
+    db.prepare(
+      `INSERT OR REPLACE INTO discord_channel_cursors (channel_id, last_seen_iso, updated_at)
+       VALUES (?, ?, ?)`,
+    ).run(channelId, createdAt.toISOString(), Date.now());
+  } catch (err: unknown) {
+    console.error(
+      `[catch-up] cursor write failed for channel ${channelId}:`,
+      err,
+    );
+  }
+}
+
+export async function catchUpOnStartup(
+  opts: CatchUpOptions,
+): Promise<CatchUpResult> {
+  const { adapter, db, handler } = opts;
+  const nowFn = opts.now ?? (() => new Date());
+  const limit = opts.limit ?? 50;
+
+  const lookupRun = db.prepare(LOOKUP_ACTIVE_RUN_SQL);
+  const readCursor = db.prepare(
+    `SELECT last_seen_iso FROM discord_channel_cursors WHERE channel_id = ?`,
+  );
+
+  const results: CatchUpChannelResult[] = [];
+
+  for (const channelName of ACTIVE_CHANNEL_NAMES) {
+    const channelId = adapter.channelIds[channelName];
+
+    // Read cursor. Missing row → cursorMs === null → replay everything we
+    // fetch (up to `limit`). NaN guard: a malformed last_seen_iso shouldn't
+    // crash startup; treat as "no cursor" and replay defensively.
+    const cursorRow = readCursor.get(channelId) as
+      | { readonly last_seen_iso: string }
+      | undefined;
+    let cursorMs: number | null = null;
+    if (cursorRow !== undefined) {
+      const parsed = Date.parse(cursorRow.last_seen_iso);
+      cursorMs = Number.isFinite(parsed) ? parsed : null;
+    }
+
+    let channel: unknown;
+    try {
+      channel = await adapter.client.channels.fetch(channelId);
+    } catch (err: unknown) {
+      console.error(
+        `[catch-up] fetch channel ${channelName} (${channelId}) failed:`,
+        err,
+      );
+      results.push({ channelName, fetched: 0, replayed: 0, skipped: 0 });
+      continue;
+    }
+
+    if (!isFetchableMessagesChannel(channel) || !channel.isTextBased()) {
+      results.push({ channelName, fetched: 0, replayed: 0, skipped: 0 });
+      continue;
+    }
+
+    let messages: Message[];
+    try {
+      const collection = await channel.messages.fetch({ limit });
+      // discord.js returns a Collection (extends Map). We accept anything
+      // with a .values() iterator so the tests can use a plain Map.
+      const iterable =
+        typeof (collection as Map<string, Message>).values === "function"
+          ? (collection as Map<string, Message>).values()
+          : (collection as { values: () => Iterable<Message> }).values();
+      messages = [...iterable];
+    } catch (err: unknown) {
+      console.error(
+        `[catch-up] fetch messages for ${channelName} failed:`,
+        err,
+      );
+      results.push({ channelName, fetched: 0, replayed: 0, skipped: 0 });
+      continue;
+    }
+
+    const fetched = messages.length;
+
+    // Newer-than-cursor + non-bot, in chronological order (oldest first).
+    const fresh = messages
+      .filter((m) =>
+        cursorMs === null
+          ? true
+          : (m.createdAt instanceof Date ? m.createdAt.getTime() : 0) > cursorMs,
+      )
+      .filter((m) => m.author?.bot !== true)
+      .sort((a, b) => {
+        const at = a.createdAt instanceof Date ? a.createdAt.getTime() : 0;
+        const bt = b.createdAt instanceof Date ? b.createdAt.getTime() : 0;
+        return at - bt;
+      });
+
+    let replayed = 0;
+    let skipped = 0;
+
+    for (const msg of fresh) {
+      // Advance the cursor first (matches the live-listener invariant: the
+      // cursor records "what we observed", not "what we handled").
+      writeCursor(
+        db,
+        msg.channelId,
+        msg.createdAt instanceof Date ? msg.createdAt : nowFn(),
+      );
+
+      // Match to today's pending/partial run using the same SQL as the
+      // live listener. "Today" here is the daemon's local date at the
+      // moment of the sweep; if a message arrived yesterday during the
+      // restart, the handler will see a yesterday-dated run only if that
+      // run is still pending/partial — same semantics as live.
+      const today = localDateString(nowFn());
+      const row = lookupRun.get(adapter.channelIds[channelName], today) as
+        | ActiveHabitRun
+        | undefined;
+      if (row === undefined) {
+        skipped += 1;
+        continue;
+      }
+
+      const match: MessageMatch = {
+        run: row,
+        message: msg,
+        channelName,
+      };
+
+      try {
+        const result = handler(match);
+        if (result && typeof (result as Promise<void>).then === "function") {
+          await (result as Promise<void>);
+        }
+        replayed += 1;
+      } catch (err: unknown) {
+        console.error(
+          `[catch-up] handler threw while replaying message ${msg.id} on ${channelName}:`,
+          err,
+        );
+        // Count as skipped — the message was observed and the cursor advanced,
+        // but no successful handler invocation occurred.
+        skipped += 1;
+      }
+    }
+
+    results.push({ channelName, fetched, replayed, skipped });
+  }
+
+  return { perChannel: results };
 }
