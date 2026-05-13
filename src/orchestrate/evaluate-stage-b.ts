@@ -61,6 +61,7 @@ import type Database from "better-sqlite3";
 import type { SessionStore } from "../daemon/session-store.js";
 import {
   postToChannel,
+  type ChannelName,
   type DiscordAdapter,
   type PostResult,
 } from "../lib/discord-adapter.js";
@@ -68,6 +69,7 @@ import {
   postWin,
   type WindDownCompletion,
 } from "./wins-poster.js";
+import { formatWindDownSummary } from "./reconcile-pending-runs.js";
 
 // -----------------------------------------------------------------------------
 // Public API.
@@ -90,6 +92,18 @@ export interface EvaluateStageBOptions {
     status: "completed";
     completion: WindDownCompletion;
   }) => Promise<{ readonly posted: boolean; readonly messageId?: string }>;
+  /**
+   * Test seam: overrides the dual-channel ack post used by the
+   * pending-autonomous completion path (Task 4.1). Production callers leave
+   * it unset and get a direct `postToChannel` call. The channel parameter is
+   * the wider `ChannelName | string` because this seam fires for BOTH the
+   * source habit channel ("wind-down") and #wins.
+   */
+  readonly pendingAckPostImpl?: (opts: {
+    adapter: DiscordAdapter;
+    channel: ChannelName | string;
+    content: string;
+  }) => Promise<PostResult>;
 }
 
 export interface EvaluateStageBResult {
@@ -97,6 +111,13 @@ export interface EvaluateStageBResult {
   readonly completed: number;
   readonly missed: number;
   readonly noData: number;
+  /**
+   * Pending wind-down rows that had a Garmin onset AFTER the threshold —
+   * the verb deliberately leaves these in `status='pending'` so the user
+   * may still type "shutting down" later. Mirrors the reconciler's
+   * `stillPending` counter.
+   */
+  readonly stillPending: number;
 }
 
 // -----------------------------------------------------------------------------
@@ -270,6 +291,25 @@ async function defaultWinsPost(opts: {
   });
 }
 
+/**
+ * Default dual-channel ack post for the pending-autonomous completion
+ * path. Mirrors the reconciler's `postDualChannel` (source channel +
+ * #wins), but the dispatch lives inline in `evaluateStageB` so each
+ * post can be wrapped in its own try/catch. This default just hands
+ * the call off to `postToChannel`.
+ */
+async function defaultPendingAckPost(opts: {
+  adapter: DiscordAdapter;
+  channel: ChannelName | string;
+  content: string;
+}): Promise<PostResult> {
+  return postToChannel({
+    adapter: opts.adapter,
+    channel: opts.channel,
+    content: opts.content,
+  });
+}
+
 // -----------------------------------------------------------------------------
 // Curious follow-up template (design § 4 — verbatim phrasing).
 // -----------------------------------------------------------------------------
@@ -390,6 +430,85 @@ function applyMissed(
   tx();
 }
 
+/**
+ * Task 4.1: complete a pending wind-down run autonomously from Garmin
+ * alone. The user never typed "shutting down" (no stage A row in
+ * proof_stages), but the sleep onset is at-or-before the threshold —
+ * the desired behaviour fired even though the verbal commitment didn't.
+ *
+ * Writes are bundled into one transaction:
+ *   - INSERT a stage='b' proof_stages row with `autoDetected:true` in
+ *     `data_json` so the audit trail records that this completion was
+ *     decided without a typed-msg stage A.
+ *   - UPDATE habit_runs to status='completed', clear `next_escalation_at`,
+ *     and persist a Garmin-shaped proof_payload_json matching the
+ *     reconciler's payload shape (source, sleep_onset, autoDetected).
+ *   - Append a `habit_completed` session event at L1 trust carrying
+ *     `autoDetected:true`.
+ *
+ * Discord posts (source channel + #wins) happen AFTER the transaction
+ * commits — caller dispatches via the optional `pendingAckPostImpl`
+ * seam. We do NOT post via `wins-poster.postWin` here because that path
+ * requires a typed `WindDownCompletion.stageATime` and we don't have a
+ * stage A timestamp in the pending-autonomous case.
+ */
+interface PendingAutonomousContext {
+  readonly sessionStore: SessionStore;
+  readonly sessionId: string;
+  readonly now: number;
+  readonly run: PartialRunRow;
+}
+
+function applyPendingCompletedFromGarmin(
+  ctx: PendingAutonomousContext,
+  onset: string,
+): void {
+  const db = ctx.sessionStore.db;
+  const stageBId = `proof-${ctx.run.id}-b`;
+  const stageBData = JSON.stringify({
+    stage: "b",
+    satisfied_at: ctx.now,
+    sleep_onset_time: onset,
+    autoDetected: true,
+  });
+  const proofPayloadJson = JSON.stringify({
+    proof: {
+      source: "garmin",
+      sleep_onset: onset,
+      autoDetected: true,
+    },
+  });
+
+  const tx = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO proof_stages (id, run_id, stage, satisfied, satisfied_at, data_json)
+         VALUES (?, ?, 'b', 1, ?, ?)`,
+    ).run(stageBId, ctx.run.id, ctx.now, stageBData);
+
+    db.prepare(
+      `UPDATE habit_runs
+          SET status = 'completed',
+              completed_at = ?,
+              next_escalation_at = NULL,
+              proof_payload_json = ?
+        WHERE id = ?`,
+    ).run(ctx.now, proofPayloadJson, ctx.run.id);
+
+    ctx.sessionStore.append(
+      ctx.sessionId,
+      "habit_completed",
+      {
+        habitId: ctx.run.habit_id,
+        runId: ctx.run.id,
+        stage_b_onset_time: onset,
+        autoDetected: true,
+      },
+      { trustLevel: "L1" },
+    );
+  });
+  tx();
+}
+
 // -----------------------------------------------------------------------------
 // Verb entry point.
 // -----------------------------------------------------------------------------
@@ -400,15 +519,21 @@ export async function evaluateStageB(
   const db = opts.sessionStore.db;
   const post = opts.postImpl ?? defaultWindDownPost;
   const wins = opts.winsPostImpl ?? defaultWinsPost;
+  const pendingAck = opts.pendingAckPostImpl ?? defaultPendingAckPost;
 
   const yesterday = localDateString(opts.now - 24 * 3_600_000);
   const threshold = loadStageBThreshold(db, "wind-down");
 
+  // Task 4.1: loosened to include `pending` rows so the verb can complete
+  // wind-down runs autonomously from Garmin even when the user never typed
+  // "shutting down". The reconciler does the same on its 2-minute cron; this
+  // is intentional redundancy — both verbs converge on the same idempotent
+  // SQL filter.
   const rows = db
     .prepare(
       `SELECT id, habit_id, fire_date FROM habit_runs
          WHERE habit_id = 'wind-down'
-           AND status = 'partial'
+           AND status IN ('pending','partial')
            AND fire_date = ?
          ORDER BY fired_at ASC`,
     )
@@ -418,6 +543,7 @@ export async function evaluateStageB(
   let completed = 0;
   let missed = 0;
   let noData = 0;
+  let stillPending = 0;
 
   for (const run of rows) {
     attempted += 1;
@@ -429,16 +555,62 @@ export async function evaluateStageB(
     }
 
     const stageAEpoch = loadStageASatisfiedAt(db, run.id);
+
     if (stageAEpoch === undefined) {
-      // Defensive: a partial run should always have a stage A row. If it
-      // doesn't, log to stderr and treat as noData so the row stays
-      // 'partial' rather than getting incorrectly resolved.
-      console.error(
-        `[evaluate-stage-b] partial run ${run.id} has no stage A proof — leaving partial`,
+      // Pending path (Task 4.1): no stage A row → decide on Garmin alone.
+      // Onset > threshold leaves the row pending (the user may still type
+      // "shutting down" later; the miss-transition lives in the partial
+      // path after stage A lands). Onset ≤ threshold autonomously completes.
+      if (onset > threshold) {
+        stillPending += 1;
+        continue;
+      }
+
+      applyPendingCompletedFromGarmin(
+        {
+          sessionStore: opts.sessionStore,
+          sessionId: opts.sessionId,
+          now: opts.now,
+          run,
+        },
+        onset,
       );
-      noData += 1;
+      completed += 1;
+
+      // Dual-channel ack: source channel + #wins. Each post is wrapped in
+      // its own try/catch — the DB write is already committed and a flaky
+      // channel must not prevent the sibling post or abort the batch.
+      // Mirrors `reconcile-pending-runs.ts:postDualChannel`.
+      const summary = formatWindDownSummary(onset, threshold);
+      try {
+        await pendingAck({
+          adapter: opts.adapter,
+          channel: "wind-down",
+          content: summary,
+        });
+      } catch (err: unknown) {
+        console.error(
+          `[evaluate-stage-b] source-channel ack post failed for run ${run.id}`,
+          err,
+        );
+      }
+      try {
+        await pendingAck({
+          adapter: opts.adapter,
+          channel: "wins",
+          content: summary,
+        });
+      } catch (err: unknown) {
+        console.error(
+          `[evaluate-stage-b] wins ack post failed for run ${run.id}`,
+          err,
+        );
+      }
       continue;
     }
+
+    // Partial path (unchanged): stage A row present → use the existing
+    // applyCompleted / applyMissed helpers with stage A timing.
     const stageATime = localHHMM(stageAEpoch);
 
     // Lexicographic comparison is equivalent to time comparison on zero-padded HH:MM.
@@ -488,7 +660,7 @@ export async function evaluateStageB(
     }
   }
 
-  return { attempted, completed, missed, noData };
+  return { attempted, completed, missed, noData, stillPending };
 }
 
 // -----------------------------------------------------------------------------

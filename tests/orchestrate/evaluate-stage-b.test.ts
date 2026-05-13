@@ -401,6 +401,7 @@ describe("evaluateStageB()", () => {
       completed: 1,
       missed: 0,
       noData: 0,
+      stillPending: 0,
     });
 
     const run = readRun(harness.db, runId);
@@ -474,6 +475,7 @@ describe("evaluateStageB()", () => {
       completed: 0,
       missed: 1,
       noData: 0,
+      stillPending: 0,
     });
 
     const run = readRun(harness.db, runId);
@@ -603,6 +605,7 @@ describe("evaluateStageB()", () => {
       completed: 0,
       missed: 0,
       noData: 1,
+      stillPending: 0,
     });
     const run = readRun(harness.db, runId);
     expect(run?.status).toBe("partial");
@@ -655,6 +658,7 @@ describe("evaluateStageB()", () => {
       completed: 0,
       missed: 0,
       noData: 0,
+      stillPending: 0,
     });
     expect(post.calls).toHaveLength(0);
     expect(wins.calls).toHaveLength(0);

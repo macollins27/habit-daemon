@@ -234,7 +234,7 @@ function loadGarminOnsetHHMM(
   return extractHHMM(payload.sleep.sleep_onset_time);
 }
 
-function formatWindDownSummary(onset: string, threshold: string): string {
+export function formatWindDownSummary(onset: string, threshold: string): string {
   return `✓ Wind-down · asleep ${onset} (threshold ${threshold})`;
 }
 
