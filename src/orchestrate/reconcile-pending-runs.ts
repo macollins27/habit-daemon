@@ -35,11 +35,29 @@ export interface ReconcileResult {
 export interface ReconcileOptions {
   readonly sessionStore: SessionStore;
   readonly now: number;
+  /**
+   * Refresh the Concept2 cache for the run's date. The wrapper MUST cause
+   * `sensor_signals` to be keyed by the run's local `fire_date` — the
+   * reconciler later reads `sensor_signals` using that local-date key.
+   *
+   * The underlying adapter (`src/lib/concept2-adapter.ts:266 (toIsoDate)`)
+   * keys by UTC date. The wrapper must therefore translate `opts.date` to
+   * the local YYYY-MM-DD (see `localDateString` in this file) before
+   * calling the adapter, or the late-evening east-of-UTC case will miss
+   * freshly-synced data. See ADR 0001 for the local-time convention.
+   */
   readonly concept2Sync: (opts: {
     habitId: string;
     runId: string;
     date: Date;
   }) => Promise<void>;
+  /**
+   * Refresh the Garmin cache for the run's date. Same TZ contract as
+   * `concept2Sync`: the wrapper MUST cause `sensor_signals` to be keyed
+   * by the run's local `fire_date`. If the underlying adapter keys by
+   * UTC (cf. `src/lib/concept2-adapter.ts:266 (toIsoDate)`), translate
+   * via `localDateString` before calling the adapter. See ADR 0001.
+   */
   readonly garminSync: (opts: {
     habitId: string;
     runId: string;
@@ -261,16 +279,36 @@ export async function reconcilePendingRuns(
     // habits.channel_id — a Discord snowflake) AND to #wins (a channel
     // name keyword resolved by the wrapper via adapter.channelIds.wins).
     // The asymmetry is intentional and is unified by the Task 1.5 wiring.
-    await opts.postCompletion({
-      channelId: row.channel_id,
-      runId: row.id,
-      summary,
-    });
-    await opts.postCompletion({
-      channelId: "wins",
-      runId: row.id,
-      summary,
-    });
+    //
+    // The DB write above is irreversible (status is already 'completed').
+    // Each post failure is logged to stderr but MUST NOT abort the batch
+    // or prevent the sibling post — otherwise a flaky channel could leave
+    // the user without an ack AND block reconciliation of remaining rows.
+    // Pattern mirrors `verify-proof.ts:670-682` (Stage-A wind-down ack).
+    try {
+      await opts.postCompletion({
+        channelId: row.channel_id,
+        runId: row.id,
+        summary,
+      });
+    } catch (err: unknown) {
+      console.error(
+        `[reconcile-pending-runs] source-channel ack post failed for run ${row.id}`,
+        err,
+      );
+    }
+    try {
+      await opts.postCompletion({
+        channelId: "wins",
+        runId: row.id,
+        summary,
+      });
+    } catch (err: unknown) {
+      console.error(
+        `[reconcile-pending-runs] wins ack post failed for run ${row.id}`,
+        err,
+      );
+    }
 
     completed += 1;
   }

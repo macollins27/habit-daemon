@@ -66,7 +66,7 @@ const noopPostCompletion = async (_opts: {
 // Tests.
 // -----------------------------------------------------------------------------
 
-describe("reconcilePendingRuns() — skeleton", () => {
+describe("reconcilePendingRuns()", () => {
   let tempDir: string;
   let dbPath: string;
   let sessionStore: SessionStore;
