@@ -588,12 +588,21 @@ export async function bootstrap(): Promise<BootstrapResult> {
     readonly message: Message;
   }): Promise<void> => {
     try {
+      // Use the message's createdAt (not Date.now()) so the rate-limit check
+      // operates on the user's actual send time. Critical for catch-up
+      // replay: a batch of queued messages from a restart window must each
+      // be evaluated against when they were ORIGINALLY sent, not when the
+      // daemon happens to be replaying them. Otherwise the first replayed
+      // message writes assistant_message_sent and rate-limits all siblings.
+      const messageNow = args.message.createdAt instanceof Date
+        ? args.message.createdAt.getTime()
+        : Date.now();
       await handleUserMessage({
         sessionStore: ledger.sessionStore,
         channelId: args.channelId,
         channelName: args.channelName,
         text: args.text,
-        now: Date.now(),
+        now: messageNow,
         dispatchImpl: dispatchClaudeForChat,
         postImpl: async ({
           channelId,

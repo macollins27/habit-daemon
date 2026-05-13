@@ -139,8 +139,17 @@ export async function handleUserMessage(
   // 6. Post to Discord. Wrap in its own try/catch — a post failure (rate
   //    limit, network blip, channel deleted) must not propagate to the
   //    listener thread. Matches the reconciler's swallow-and-log pattern.
+  //
+  //    Discord's hard limit is 2000 chars per message; replies over that
+  //    get rejected. The system prompt caps at ~200 words but a Claude
+  //    response can still overshoot — truncate defensively at 1900 chars
+  //    with an ellipsis so the user gets a partial reply instead of silent
+  //    nothing.
+  const postContent = replyText.length > 1900
+    ? `${replyText.slice(0, 1900)}…`
+    : replyText;
   try {
-    await opts.postImpl({ channelId, content: replyText });
+    await opts.postImpl({ channelId, content: postContent });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(
