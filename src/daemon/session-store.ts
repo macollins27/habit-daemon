@@ -11,36 +11,75 @@ import { buildRecord, type AatRecord, type TrustLevel } from "./aat-chain.js";
 export type SessionStatus = "active" | "completed" | "failed" | "aborted";
 
 /**
- * Allowed values for `session_events.event_type`. 15 of these come from the
- * design doc § 2 (habit-daemon-design.md, session_events extension list) and
- * `sensor_failure_logged` comes from Phase A plan Task 15. The SQLite CHECK
- * constraint on `session_events.event_type` is "NULL OR IN (these 16 values)";
- * new code MUST pass one of these literals via `SessionStore.append()`. The
- * column remains nullable to allow infrastructure-level events (carried over
- * from the predecessor fork) that predate this typed taxonomy.
+ * Allowed values for `session_events.event_type`.
+ *
+ * IMPORTANT — drift policy: this list is the single TS-side source of truth.
+ * The `SessionEventType` union and the `applySchema()` CHECK clause are BOTH
+ * derived from `SESSION_EVENT_TYPES` below at module load, so adding a new
+ * value here automatically updates the static-typing guard AND the
+ * fresh-DB-bypass-migration guard.
+ *
+ * The THIRD location — the latest migration's `session_events.event_type`
+ * CHECK constraint in `src/db/migrations/` (currently
+ * `004_chat_and_web_ui.sql`) — cannot import from TypeScript and must be
+ * updated by hand. When adding a new event type:
+ *
+ *   1. Append the literal to `SESSION_EVENT_TYPES` below.
+ *   2. Add a corresponding entry to the latest migration's CHECK list.
+ *
+ * The migration is the canonical historical record (the source of truth for
+ * any pre-existing database file); the TS union/CHECK is the fresh-DB guard
+ * used by tests that call `new SessionStore()` directly without running the
+ * migration ladder.
+ *
+ * 16 of the 22 values come from the design doc § 2 + Phase-A plan Task 15
+ * (`sensor_failure_logged`); the final 6 come from migration
+ * `004_chat_and_web_ui.sql` (chat events + habit-CRUD lifecycle). The column
+ * remains nullable to allow infrastructure-level events (carried over from
+ * the predecessor fork) that predate this typed taxonomy.
  */
-export type SessionEventType =
+export const SESSION_EVENT_TYPES = [
   // Habit-flow events (8): lifecycle of a single habit run.
-  | "habit_prompt_sent"
-  | "habit_user_response"
-  | "habit_proof_received"
-  | "habit_completed"
-  | "habit_missed"
-  | "habit_skip_requested"
-  | "habit_dodge_requested"
-  | "proof_attempt_rejected"
+  "habit_prompt_sent",
+  "habit_user_response",
+  "habit_proof_received",
+  "habit_completed",
+  "habit_missed",
+  "habit_skip_requested",
+  "habit_dodge_requested",
+  "proof_attempt_rejected",
 
   // Proposal events (7): self-improvement proposal lifecycle.
-  | "proposal_emitted"
-  | "proposal_applied"
-  | "proposal_rejected"
-  | "proposal_discussion_opened"
-  | "proposal_discussion_message"
-  | "proposal_resolved"
-  | "plan_change_applied"
+  "proposal_emitted",
+  "proposal_applied",
+  "proposal_rejected",
+  "proposal_discussion_opened",
+  "proposal_discussion_message",
+  "proposal_resolved",
+  "plan_change_applied",
 
   // Infrastructure events (1): non-habit, non-proposal signal.
-  | "sensor_failure_logged";
+  "sensor_failure_logged",
+
+  // Chat / web-UI events (6): conversational chat + habit-CRUD lifecycle
+  // (added by migration 004_chat_and_web_ui.sql).
+  "user_message_received",
+  "assistant_message_sent",
+  "habit_created",
+  "habit_updated",
+  "habit_archived",
+  "habit_unarchived",
+] as const;
+
+export type SessionEventType = (typeof SESSION_EVENT_TYPES)[number];
+
+// SQL literal list rendered once at module load for the applySchema CHECK
+// clause. Quoted with single quotes (SQLite string literal syntax) and
+// joined with commas. The list is "is NULL OR IN (...)" so existing rows
+// pre-dating the typed taxonomy still validate.
+const SESSION_EVENT_TYPES_SQL_LIST = SESSION_EVENT_TYPES.map(
+  (t) => `'${t}'`,
+).join(", ");
 
 export interface SessionRow {
   readonly session_id: string;
@@ -86,6 +125,12 @@ export class SessionStore {
   }
 
   private applySchema(): void {
+    // The event_type CHECK literal list is derived from SESSION_EVENT_TYPES
+    // above so the TS union and this fresh-DB guard cannot drift apart. The
+    // third location — the latest migration's CHECK clause — is kept in sync
+    // by hand (see the comment on SESSION_EVENT_TYPES). Interpolation is
+    // safe here: the values are compile-time constant string literals, not
+    // user input.
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         session_id      TEXT PRIMARY KEY,
@@ -104,12 +149,7 @@ export class SessionStore {
         hash          TEXT NOT NULL,
         trust_level   TEXT NOT NULL CHECK(trust_level IN ('L0','L1','L2','L3','L4')),
         event_type    TEXT CHECK(event_type IS NULL OR event_type IN (
-          'habit_prompt_sent', 'habit_user_response', 'habit_proof_received',
-          'habit_completed', 'habit_missed', 'habit_skip_requested',
-          'habit_dodge_requested', 'proof_attempt_rejected', 'proposal_emitted',
-          'proposal_applied', 'proposal_rejected', 'proposal_discussion_opened',
-          'proposal_discussion_message', 'proposal_resolved', 'plan_change_applied',
-          'sensor_failure_logged'
+          ${SESSION_EVENT_TYPES_SQL_LIST}
         )),
         written_iso   TEXT NOT NULL,
         UNIQUE(session_id, seq)

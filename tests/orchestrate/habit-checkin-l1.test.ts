@@ -214,8 +214,53 @@ describe("getEscalationDeltaMinutes()", () => {
     expect(getEscalationDeltaMinutes("wind-down", 3)).toBe(2);
   });
 
-  it("throws on unknown habit id", () => {
-    expect(() => getEscalationDeltaMinutes("unknown-habit", 1)).toThrow();
+  // -------------------------------------------------------------------------
+  // User-created habit fallback (id = `habit_<slug>`, not in the per-habit
+  // map). Before this fallback, the first scheduler tick on any user-created
+  // habit crashed inside this verb — same shape as the channel-routing bug
+  // fixed in commit 319305f. Defaults: L1=10, L2=15, L3=30, L4=60, L5=null
+  // (terminal).
+  // -------------------------------------------------------------------------
+
+  it("user-created habit at L1 returns the default delta (10 min)", () => {
+    expect(getEscalationDeltaMinutes("habit_evening-walk", 1)).toBe(10);
+  });
+
+  it("user-created habit at L2 returns the default delta (15 min)", () => {
+    expect(getEscalationDeltaMinutes("habit_evening-walk", 2)).toBe(15);
+  });
+
+  it("user-created habit at L3 returns the default delta (30 min)", () => {
+    expect(getEscalationDeltaMinutes("habit_evening-walk", 3)).toBe(30);
+  });
+
+  it("user-created habit at L4 returns the default delta (60 min)", () => {
+    expect(getEscalationDeltaMinutes("habit_evening-walk", 4)).toBe(60);
+  });
+
+  it("user-created habit at L5 returns the terminal sentinel (null)", () => {
+    expect(getEscalationDeltaMinutes("habit_evening-walk", 5)).toBeNull();
+  });
+
+  it("does not throw on an unknown habit id at any escalation level L1..L5", () => {
+    for (const level of [1, 2, 3, 4, 5]) {
+      expect(() =>
+        getEscalationDeltaMinutes("habit_any-user-slug", level),
+      ).not.toThrow();
+    }
+  });
+
+  it("seed habit terminal level L5 returns null (matches default-table shape)", () => {
+    expect(getEscalationDeltaMinutes("morning-row", 5)).toBeNull();
+    expect(getEscalationDeltaMinutes("strength-mwf", 5)).toBeNull();
+  });
+
+  it("still throws for a KNOWN habit at an explicit gap (wind-down L4 — design § 3 terminal)", () => {
+    // Preserves the Task 30 fail-fast contract: unsupported (habit, level)
+    // combinations on a known habit row must throw atomically, BEFORE any
+    // dispatch or Discord post. Only unknown habit ids fall through to the
+    // default table.
+    expect(() => getEscalationDeltaMinutes("wind-down", 4)).toThrow();
   });
 });
 
