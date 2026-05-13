@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 
 # Canned payload used by --stub mode. Tests pin these exact values.
@@ -63,6 +64,13 @@ def cmd_stub(args: argparse.Namespace) -> None:
     sys.exit(0)
 
 
+# garminconnect's Garmin.login() does NOT auto-persist tokens. They live
+# in-memory only unless `tokenstore=<path>` is passed, in which case the
+# library writes them with client.dump(tokenstore_path). Same path must be
+# passed back on subsequent loads.
+TOKENSTORE_PATH = str(Path.home() / ".garminconnect")
+
+
 def cmd_login() -> None:
     """Interactive login flow. Seeds the local token cache."""
     try:
@@ -78,9 +86,11 @@ def cmd_login() -> None:
     try:
         client = Garmin(email=email, password=password)
         # The garminconnect library prompts for MFA interactively on stdin
-        # if the account has it enabled. Tokens are written to ~/.garminconnect/.
-        client.login()
-        sys.stderr.write("Login successful. Tokens cached at ~/.garminconnect/.\n")
+        # if the account has it enabled. Tokens are dumped to TOKENSTORE_PATH
+        # on success — the path must be passed explicitly; the library does
+        # not auto-persist without it.
+        client.login(tokenstore=TOKENSTORE_PATH)
+        sys.stderr.write(f"Login successful. Tokens cached at {TOKENSTORE_PATH}.\n")
         sys.exit(0)
     except Exception as exc:  # noqa: BLE001 - library raises bare Exception
         sys.stderr.write(f"Login failed: {exc}\n")
@@ -105,8 +115,9 @@ def cmd_fetch(args: argparse.Namespace) -> None:
 
     try:
         client = Garmin()
-        # Re-uses tokens cached at ~/.garminconnect/. Raises if missing/expired.
-        client.login()
+        # Loads tokens from TOKENSTORE_PATH. Raises if the path doesn't exist
+        # (no prior --login) or if the tokens are expired beyond refresh.
+        client.login(tokenstore=TOKENSTORE_PATH)
     except Exception as exc:  # noqa: BLE001
         sys.stderr.write(f"Auth failed (token may be expired): {exc}\n")
         sys.exit(2)
