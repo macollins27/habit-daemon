@@ -26,6 +26,10 @@ import { z } from "zod";
 import type { SessionStore } from "../daemon/session-store.js";
 import { serializeHabit, type HabitResponse } from "./serialize.js";
 import { computeStats, type HabitRunForStats } from "./stats.js";
+import { HabitCreateInput, HabitPatchInput } from "./schemas.js";
+import { createHabit } from "../orchestrate/create-habit.js";
+import { updateHabit } from "../orchestrate/update-habit.js";
+import { archiveHabit, unarchiveHabit } from "../orchestrate/archive-habit.js";
 
 // Bounded limit for the /runs endpoint. Defaults to 30, max 365 — values
 // outside the range are clamped (not rejected) so a UI passing an
@@ -252,6 +256,135 @@ export function buildApp(deps: ApiDeps): Hono {
       )
       .all(id) as ReadonlyArray<HabitRunForStats>;
     return c.json(computeStats(rows));
+  });
+
+  // POST /api/habits — create a new habit.
+  //
+  // The orchestrator (`createHabit`) is the single source of truth for
+  // validation, ID derivation (`habit_` + slug), and the audit-event write.
+  // We perform an outer `safeParse` so a malformed body produces a 400 with
+  // Zod's `.format()` shape instead of letting the orchestrator's inner
+  // `.parse()` throw a ZodError (which would surface as a 500). Both checks
+  // are cheap and structurally identical; the outer one only exists to
+  // bridge "throw" → "structured 400".
+  //
+  // Error-message-based status branching mirrors the exact substrings the
+  // orchestrator throws (see `src/orchestrate/create-habit.ts`):
+  //   "habit slug already exists"  → 409
+  //   "invalid cron expression"    → 400
+  // Anything else re-throws to the framework's default 500 handler.
+  app.post("/api/habits", async (c) => {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "invalid JSON body" }, 400);
+    }
+    const parsed = HabitCreateInput.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.format() }, 400);
+    }
+    try {
+      const result = createHabit({
+        sessionStore: deps.sessionStore,
+        input: parsed.data,
+      });
+      return c.json({ id: result.id }, 201);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("slug already exists")) {
+        return c.json({ error: msg }, 409);
+      }
+      if (msg.includes("invalid cron")) {
+        return c.json({ error: msg }, 400);
+      }
+      throw err;
+    }
+  });
+
+  // PATCH /api/habits/:id — partial update.
+  //
+  // Maps orchestrator throws:
+  //   "unknown habit id"       → 404
+  //   "patch is empty"         → 400
+  //   "invalid cron expression"→ 400
+  //   "slug is immutable"      → 400
+  // Returns 204 on success (no body), matching standard REST conventions
+  // for idempotent partial-mutating endpoints.
+  app.patch("/api/habits/:id", async (c) => {
+    const id = c.req.param("id");
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "invalid JSON body" }, 400);
+    }
+    const parsed = HabitPatchInput.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.format() }, 400);
+    }
+    try {
+      updateHabit({
+        sessionStore: deps.sessionStore,
+        id,
+        patch: parsed.data,
+      });
+      return c.body(null, 204);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("unknown habit id")) {
+        return c.json({ error: msg }, 404);
+      }
+      if (msg.includes("patch is empty")) {
+        return c.json({ error: msg }, 400);
+      }
+      if (msg.includes("invalid cron")) {
+        return c.json({ error: msg }, 400);
+      }
+      if (msg.includes("slug is immutable")) {
+        return c.json({ error: msg }, 400);
+      }
+      throw err;
+    }
+  });
+
+  // DELETE /api/habits/:id — soft-delete (archive).
+  //
+  // Idempotent: re-deleting an already-archived row is a silent no-op in
+  // `archiveHabit`, so a second DELETE still returns 204. Unknown-id is
+  // 404 (matches the orchestrator's hard throw — distinct from the silent
+  // already-archived path).
+  app.delete("/api/habits/:id", (c) => {
+    const id = c.req.param("id");
+    try {
+      archiveHabit({ sessionStore: deps.sessionStore, id });
+      return c.body(null, 204);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("unknown habit id")) {
+        return c.json({ error: msg }, 404);
+      }
+      throw err;
+    }
+  });
+
+  // POST /api/habits/:id/unarchive — restore a soft-deleted habit.
+  //
+  // Idempotent in the same shape as DELETE: re-unarchiving an active row
+  // is a silent no-op (`unarchiveHabit`). Distinct route rather than a
+  // PATCH because the state transition is a discrete, non-partial verb.
+  app.post("/api/habits/:id/unarchive", (c) => {
+    const id = c.req.param("id");
+    try {
+      unarchiveHabit({ sessionStore: deps.sessionStore, id });
+      return c.body(null, 204);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("unknown habit id")) {
+        return c.json({ error: msg }, 404);
+      }
+      throw err;
+    }
   });
 
   // GET /api/activity — cursor-paginated recent-activity feed.
