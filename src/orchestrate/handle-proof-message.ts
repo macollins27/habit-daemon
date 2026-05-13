@@ -42,6 +42,7 @@ import { postWin, type Completion } from "./wins-poster.js";
 import { recordVisionRejection } from "./vision-rejection-counter.js";
 import type { VisionRejection } from "./vision-rejection-counter.js";
 import { postToChannel } from "../lib/discord-adapter.js";
+import { ESCALATION_FOLLOW_UP_CONTENT } from "./habit-checkin.js";
 
 export interface HandleProofMessageOptions {
   readonly sessionStore: SessionStore;
@@ -129,17 +130,35 @@ export async function handleProofMessage(
 
   switch (result.outcome) {
     case "completed": {
+      // Phase 6.2: read the escalation tracker BEFORE applyCompleted runs
+      // its UPDATE (the UPDATE doesn't clear the column, so order is purely
+      // a defensive choice — fetching first means a future change that
+      // clears the column on completion can't silently regress this check).
+      const lastEscalationMessageId = loadLastEscalationMessageId(
+        db,
+        opts.run.id,
+      );
+
       await applyCompleted(opts, result.proofPayload);
+
       // Source-channel ack — fires even when buildCompletionForHabit returns
       // null (the #wins post is skipped in that case, but the user still gets
       // an in-channel "got it" so they aren't left wondering). Wrapped in an
       // independent try/catch matching `verify-proof.ts:670-682` so a flaky
       // channel post never blows up the rest of the handler.
+      //
+      // Phase 6.2 composite: when a prior escalation was tracked, the
+      // follow-up REPLACES the standard ack — a single message reads
+      // better than the two-message version of the same outcome.
+      const ackContent =
+        lastEscalationMessageId !== null
+          ? ESCALATION_FOLLOW_UP_CONTENT
+          : "Got it — see #wins. ✓";
       try {
         await postToChannel({
           adapter: opts.adapter,
           channel: opts.message.channelId,
-          content: "Got it — see #wins. ✓",
+          content: ackContent,
         });
       } catch (err: unknown) {
         console.error(
@@ -197,6 +216,29 @@ export async function handleProofMessage(
       return;
     }
   }
+}
+
+/**
+ * Phase 6.2: load `habit_runs.last_escalation_message_id` for a run.
+ *
+ * Returns the captured Discord message id of the most recent escalation, or
+ * null if no escalation has been posted for this run yet (rare but possible
+ * — e.g. user posts proof before any scheduler tick fires for the day). The
+ * completed-path ack uses this to pick between the follow-up text and the
+ * standard "Got it" text.
+ */
+function loadLastEscalationMessageId(
+  db: import("better-sqlite3").Database,
+  runId: string,
+): string | null {
+  const row = db
+    .prepare(
+      `SELECT last_escalation_message_id FROM habit_runs WHERE id = ?`,
+    )
+    .get(runId) as
+    | { readonly last_escalation_message_id: string | null }
+    | undefined;
+  return row?.last_escalation_message_id ?? null;
 }
 
 async function applyCompleted(
