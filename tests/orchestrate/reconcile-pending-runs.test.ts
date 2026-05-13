@@ -185,6 +185,109 @@ describe("reconcilePendingRuns()", () => {
   });
 
   // ---------------------------------------------------------------------
+  // Task 1.4: Idempotency.
+  //
+  // Idempotency comes for free from the SQL filter — `loadPendingRuns`
+  // restricts to `status IN ('pending','partial')`, so once a run is
+  // flipped to 'completed' the second call won't pick it up. This test
+  // pins that invariant so future refactors of `loadPendingRuns` don't
+  // silently regress it (e.g. expanding the IN clause to include
+  // 'completed' would cause double posting to #wins).
+  // ---------------------------------------------------------------------
+  it("is idempotent: running twice with the same data completes once on the first call, zero on the second", async () => {
+    const db = sessionStore.db;
+    const runId = "test-run-idempotent";
+    const fireDate = "2026-05-13";
+    const nowMs = Date.parse("2026-05-13T15:00:00Z");
+
+    db.prepare(
+      `INSERT INTO habit_runs (
+         id, habit_id, fire_date, fired_at, current_level, next_escalation_at,
+         status, completed_at, proof_payload_json, skip_reason,
+         proof_rejection_callout_due
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      runId,
+      "morning-row",
+      fireDate,
+      Date.parse("2026-05-13T09:05:00Z"),
+      1,
+      null,
+      "pending",
+      null,
+      null,
+      null,
+      0,
+    );
+
+    const qualifyingSession = {
+      id: 999,
+      date: "2026-05-13 09:35:00",
+      type: "rower",
+      duration_seconds: 603.3,
+      distance_meters: 2279,
+    };
+    db.prepare(
+      `INSERT INTO sensor_signals (id, source, payload_date, payload_json, fetched_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run(
+      "concept2-2026-05-13",
+      "concept2",
+      fireDate,
+      JSON.stringify({ results: [qualifyingSession] }),
+      nowMs,
+    );
+
+    const posts: Array<{ channelId: string; summary: string }> = [];
+    const postCompletion = async (o: {
+      channelId: string;
+      runId: string;
+      summary: string;
+    }): Promise<void> => {
+      posts.push({ channelId: o.channelId, summary: o.summary });
+    };
+
+    // First call: closes the pending run.
+    const first = await reconcilePendingRuns({
+      sessionStore,
+      now: nowMs,
+      concept2Sync: async () => {},
+      garminSync: async () => {},
+      postCompletion,
+    });
+
+    expect(first.attempted).toBe(1);
+    expect(first.completed).toBe(1);
+    expect(first.stillPending).toBe(0);
+    expect(posts).toHaveLength(2);
+
+    // Second call with identical inputs: the WHERE clause in
+    // loadPendingRuns excludes status='completed', so the run is
+    // invisible and there is nothing to attempt.
+    const second = await reconcilePendingRuns({
+      sessionStore,
+      now: nowMs,
+      concept2Sync: async () => {},
+      garminSync: async () => {},
+      postCompletion,
+    });
+
+    expect(second.attempted).toBe(0);
+    expect(second.completed).toBe(0);
+    expect(second.stillPending).toBe(0);
+
+    // Row remains completed — not regressed, not re-stamped.
+    const updated = db
+      .prepare("SELECT status, completed_at FROM habit_runs WHERE id = ?")
+      .get(runId) as { status: string; completed_at: number | null };
+    expect(updated.status).toBe("completed");
+    expect(updated.completed_at).toBe(nowMs);
+
+    // No additional posts on the second call — total stays at 2.
+    expect(posts).toHaveLength(2);
+  });
+
+  // ---------------------------------------------------------------------
   // Task 1.3: Garmin wind-down branch.
   //
   // The wind-down branch handles BOTH `status='pending'` AND
