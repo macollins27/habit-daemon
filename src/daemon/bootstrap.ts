@@ -42,9 +42,11 @@ import {
   loadDiscordChannelIdsFromEnv,
   postToChannel,
   subscribeMessages,
+  type ChannelName,
   type DiscordAdapter,
   type MessageMatch,
 } from "../lib/discord-adapter.js";
+import type { Message } from "discord.js";
 import { dispatchClaude } from "./sdk-dispatch.js";
 import { parseClaudeEnvelope } from "./verify-footer.js";
 import {
@@ -72,6 +74,7 @@ import {
   registerReconcilePendingRunsCron,
 } from "../orchestrate/reconcile-pending-runs.js";
 import { handleProofMessage } from "../orchestrate/handle-proof-message.js";
+import { handleUserMessage } from "../orchestrate/handle-user-message.js";
 import type { DispatchFn } from "./scheduler.js";
 
 interface HabitRow {
@@ -206,6 +209,64 @@ async function dispatchClaudeForCheckin(opts: {
   const env = parseClaudeEnvelope(result.stdout);
   if (!env.ok) return { error: env.error };
   return { structured_output: env.envelope.structured_output };
+}
+
+/**
+ * Wrap dispatchClaude for the chat orchestrator. Returns the reply text and
+ * the envelope's total_cost_usd so handleUserMessage can record it in
+ * `assistant_message_sent`.
+ *
+ * The system prompt is prepended to the user message (rather than passed via
+ * --append-system-prompt-file) because writing a temp file per chat message
+ * would be wasteful and the model treats prepended instructions equivalently
+ * for a single-turn Q&A. We still enforce a `{reply: string}` JSON schema so
+ * the envelope shape is predictable.
+ *
+ * Throws on any dispatch / parse failure so handleUserMessage's error path
+ * fires and posts the apology message.
+ */
+async function dispatchClaudeForChat(opts: {
+  readonly system: string;
+  readonly user: string;
+  readonly maxBudgetUsd: number;
+}): Promise<{ text: string; cost_usd: number }> {
+  const jsonSchema = JSON.stringify({
+    type: "object",
+    properties: { reply: { type: "string" } },
+    required: ["reply"],
+    additionalProperties: false,
+  });
+  const result = dispatchClaude({
+    model: "claude-haiku-4-5-20251001",
+    prompt: `${opts.system}\n\n---\n\nUser: ${opts.user}`,
+    jsonSchema,
+    allowedTools: [],
+    maxTurns: 3,
+    maxBudgetUsd: opts.maxBudgetUsd,
+  });
+  if (result.status !== "success" && result.status !== "dry_run") {
+    throw new Error(
+      `claude -p exited ${result.status} (code=${result.exitCode}): stderr=${(result.stderr ?? "").slice(0, 600)} | stdout=${(result.stdout ?? "").slice(0, 600)}`,
+    );
+  }
+  const env = parseClaudeEnvelope(result.stdout);
+  if (!env.ok) throw new Error(env.error);
+
+  const structured = env.envelope.structured_output as
+    | { readonly reply?: unknown }
+    | undefined;
+  const reply =
+    structured !== undefined && typeof structured.reply === "string"
+      ? structured.reply
+      : "";
+  if (reply.length === 0) {
+    throw new Error("chat dispatch returned empty reply field");
+  }
+  const costUsd =
+    typeof env.envelope.total_cost_usd === "number"
+      ? env.envelope.total_cost_usd
+      : 0;
+  return { text: reply, cost_usd: costUsd };
 }
 
 /**
@@ -512,6 +573,57 @@ export async function bootstrap(): Promise<BootstrapResult> {
     }
   };
 
+  // Phase 4: chat fall-through. Invoked by the listener (and the catch-up
+  // sweep) when an active-channel message has no matching pending/partial
+  // run. Routes through handleUserMessage, which loads context, dispatches
+  // Claude, persists the chat events, and posts the reply.
+  //
+  // The whole body is wrapped in try/catch so a listener exception here
+  // (e.g. dispatchClaudeForChat throwing) cannot break the messageCreate
+  // pipeline for subsequent messages.
+  const handleChat = async (args: {
+    readonly channelId: string;
+    readonly channelName: ChannelName | null;
+    readonly text: string;
+    readonly message: Message;
+  }): Promise<void> => {
+    try {
+      // Use the message's createdAt (not Date.now()) so the rate-limit check
+      // operates on the user's actual send time. Critical for catch-up
+      // replay: a batch of queued messages from a restart window must each
+      // be evaluated against when they were ORIGINALLY sent, not when the
+      // daemon happens to be replaying them. Otherwise the first replayed
+      // message writes assistant_message_sent and rate-limits all siblings.
+      const messageNow = args.message.createdAt instanceof Date
+        ? args.message.createdAt.getTime()
+        : Date.now();
+      await handleUserMessage({
+        sessionStore: ledger.sessionStore,
+        channelId: args.channelId,
+        channelName: args.channelName,
+        text: args.text,
+        now: messageNow,
+        dispatchImpl: dispatchClaudeForChat,
+        postImpl: async ({
+          channelId,
+          content,
+        }: {
+          readonly channelId: string;
+          readonly content: string;
+        }) => {
+          await postToChannel({
+            adapter,
+            channel: channelId,
+            content,
+          });
+        },
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      logErr(`handleUserMessage exception: ${msg}`);
+    }
+  };
+
   // Phase 5: catch-up sweep. After Discord is ready and BEFORE the live
   // listener is wired, fetch recent messages from each active channel and
   // replay anything newer than the persisted cursor. This closes the gap
@@ -523,6 +635,7 @@ export async function bootstrap(): Promise<BootstrapResult> {
       adapter,
       db,
       handler: handleMatch,
+      chatHandler: handleChat,
     });
     logInfo(
       `discord catch-up: ${catchUpResult.perChannel
@@ -544,6 +657,7 @@ export async function bootstrap(): Promise<BootstrapResult> {
     adapter,
     db,
     handler: handleMatch,
+    chatHandler: handleChat,
   });
   logInfo(`discord listener subscribed`);
 

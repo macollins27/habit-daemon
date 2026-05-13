@@ -331,10 +331,39 @@ export interface MessageMatch {
   readonly channelName: ChannelName;
 }
 
+/**
+ * Optional chat fall-through handler for `subscribeMessages` and
+ * `catchUpOnStartup`. Invoked when a non-bot message lands in one of the
+ * three ACTIVE channels but no pending/partial habit_run matches today's
+ * fire_date — i.e. the user is talking, not submitting proof.
+ *
+ * `channelName` is the resolved ChannelName for the message's channel. It is
+ * always present (the chat handler only fires for active channels). The
+ * `null` branch in the type is reserved for a future extension that allows
+ * chat in non-active channels; today's wiring never passes null.
+ */
+export interface ChatFallthroughArgs {
+  readonly channelId: string;
+  readonly channelName: ChannelName | null;
+  readonly text: string;
+  readonly message: Message;
+}
+
+export type ChatHandler = (
+  args: ChatFallthroughArgs,
+) => Promise<void> | void;
+
 export interface SubscribeMessagesOptions {
   readonly adapter: DiscordAdapter;
   readonly db: Database.Database;
   readonly handler: (match: MessageMatch) => Promise<void> | void;
+  /**
+   * Optional chat fall-through. Fires when an active-channel message has
+   * no matching pending/partial habit_run. When omitted, the listener
+   * preserves the prior behaviour of silently skipping such messages
+   * (backward-compatible).
+   */
+  readonly chatHandler?: ChatHandler;
   // Injectable for testing. Defaults to `() => new Date()`.
   readonly now?: () => Date;
 }
@@ -373,7 +402,7 @@ const LOOKUP_ACTIVE_RUN_SQL =
     LIMIT 1`;
 
 export function subscribeMessages(opts: SubscribeMessagesOptions): Unsubscribe {
-  const { adapter, db, handler } = opts;
+  const { adapter, db, handler, chatHandler } = opts;
   const nowFn = opts.now ?? (() => new Date());
 
   const activeChannels = buildActiveChannelLookup(adapter.channelIds);
@@ -438,6 +467,38 @@ export function subscribeMessages(opts: SubscribeMessagesOptions): Unsubscribe {
       | ActiveHabitRun
       | undefined;
     if (row === undefined) {
+      // Phase 4: when an active-channel message has no matching proof run,
+      // fall through to the chat orchestrator if one is wired. Without a
+      // chatHandler the listener preserves prior behaviour (silent skip).
+      if (chatHandler !== undefined) {
+        process.stdout.write(
+          `[discord-listener] chat-fallthrough: invoking chatHandler for channel=${channelName}\n`,
+        );
+        let chatResult: Promise<void> | void;
+        try {
+          chatResult = chatHandler({
+            channelId: msg.channelId,
+            channelName,
+            text: msg.content ?? "",
+            message: msg,
+          });
+        } catch (err: unknown) {
+          console.error(
+            "[discord-listener] chatHandler threw synchronously",
+            err,
+          );
+          return;
+        }
+        if (
+          chatResult &&
+          typeof (chatResult as Promise<void>).catch === "function"
+        ) {
+          (chatResult as Promise<void>).catch((err: unknown) => {
+            console.error("[discord-listener] chatHandler rejected", err);
+          });
+        }
+        return;
+      }
       process.stdout.write(
         `[discord-listener] skip: no active habit_run for channel=${channelName} fire_date=${today}\n`,
       );
@@ -516,6 +577,13 @@ export interface CatchUpOptions {
   readonly adapter: DiscordAdapter;
   readonly db: Database.Database;
   readonly handler: (match: MessageMatch) => Promise<void> | void;
+  /**
+   * Optional chat fall-through. Fires during replay for active-channel
+   * messages that have no matching pending/partial habit_run. Mirrors the
+   * subscribeMessages chatHandler contract so the live + catch-up paths
+   * stay behaviourally identical.
+   */
+  readonly chatHandler?: ChatHandler;
   /** Injectable clock for tests. Defaults to `() => new Date()`. */
   readonly now?: () => Date;
   /** Max messages to fetch per channel. Default 50. */
@@ -565,7 +633,7 @@ function writeCursor(
 export async function catchUpOnStartup(
   opts: CatchUpOptions,
 ): Promise<CatchUpResult> {
-  const { adapter, db, handler } = opts;
+  const { adapter, db, handler, chatHandler } = opts;
   const nowFn = opts.now ?? (() => new Date());
   const limit = opts.limit ?? 50;
 
@@ -665,6 +733,32 @@ export async function catchUpOnStartup(
         | ActiveHabitRun
         | undefined;
       if (row === undefined) {
+        // Phase 4: fall through to chat replay if wired. Mirrors the live
+        // listener invariant — chat is the alternative to a silent skip.
+        if (chatHandler !== undefined) {
+          try {
+            const chatResult = chatHandler({
+              channelId: msg.channelId,
+              channelName,
+              text: msg.content ?? "",
+              message: msg,
+            });
+            if (
+              chatResult &&
+              typeof (chatResult as Promise<void>).then === "function"
+            ) {
+              await (chatResult as Promise<void>);
+            }
+            replayed += 1;
+          } catch (err: unknown) {
+            console.error(
+              `[catch-up] chatHandler threw while replaying message ${msg.id} on ${channelName}:`,
+              err,
+            );
+            skipped += 1;
+          }
+          continue;
+        }
         skipped += 1;
         continue;
       }
