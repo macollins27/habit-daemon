@@ -307,6 +307,12 @@ export interface BootstrapResult {
   readonly dispatch: DispatchFn;
   readonly sessionId: string;
   readonly cleanup: () => Promise<void>;
+  /**
+   * Live discord adapter. Exposed so the scheduler-daemon main loop can
+   * wire `adapter.isReady` into the HTTP API's /api/health endpoint
+   * without re-constructing or re-importing the adapter module.
+   */
+  readonly adapter: DiscordAdapter;
 }
 
 /**
@@ -445,5 +451,5 @@ export async function bootstrap(): Promise<BootstrapResult> {
     ledger.close();
   };
 
-  return { ledger, dispatch, sessionId, cleanup };
+  return { ledger, dispatch, sessionId, cleanup, adapter };
 }

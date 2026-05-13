@@ -29,6 +29,7 @@ import {
   AttachmentBuilder,
   Client,
   GatewayIntentBits,
+  Status,
   type ClientOptions,
   type Message,
 } from "discord.js";
@@ -68,6 +69,17 @@ export interface DiscordAdapterOptions {
 export interface DiscordAdapter {
   readonly client: Client;
   readonly channelIds: DiscordChannelIds;
+  /**
+   * `true` iff the underlying websocket is in the `Status.Ready` state.
+   *
+   * Surfaced for the `/api/health` endpoint: the daemon wires this
+   * callback into `ApiDeps.discordConnected` so a UI / monitor can tell
+   * whether the bot is currently connected to the Discord gateway. We
+   * read `client.ws.status` directly rather than tracking the `ready` /
+   * `disconnect` events ourselves — discord.js owns that state machine
+   * and any duplication would risk drift after reconnects.
+   */
+  readonly isReady: () => boolean;
 }
 
 // The three gateway intents the daemon will actually use:
@@ -106,6 +118,7 @@ export function createDiscordAdapter(opts: DiscordAdapterOptions): DiscordAdapte
   return {
     client,
     channelIds: opts.channelIds,
+    isReady: (): boolean => client.ws.status === Status.Ready,
   };
 }
 

@@ -6,11 +6,14 @@
  *     routes wired up against the supplied dependencies. It is a pure
  *     factory: no global state, safe to call repeatedly in tests. Routes
  *     are mounted under `/api/*`.
- *   - `startServer({ deps, port? })` binds a Node HTTP listener via
+ *   - `startServer(deps, port?)` binds a Node HTTP listener via
  *     `@hono/node-server`. The official adapter is preferred over a
  *     hand-rolled `http.createServer` wrapper because it streams the
  *     Hono response directly to the Node socket and handles edge cases
  *     (HEAD, abort, large bodies) that we don't want to re-implement.
+ *     Returns a Promise that resolves with `{port, close}` once the
+ *     listener is bound — `port` reflects the OS-assigned port when
+ *     callers pass `0` (used by the integration test).
  *
  * Naming bridge:
  *   The HTTP surface exposes the public API field names defined in
@@ -139,12 +142,13 @@ interface HabitListJoinRow extends Record<string, unknown> {
   readonly _today_level: number | null;
 }
 
-export interface StartServerOptions {
-  readonly deps: ApiDeps;
-  readonly port?: number;
-}
-
 export interface ServerHandle {
+  /**
+   * Bound TCP port. Equal to the requested port when the caller passed
+   * a fixed number, or the OS-assigned port when the caller passed `0`
+   * (used by the integration test in `tests/daemon/api-wiring.test.ts`).
+   */
+  readonly port: number;
   readonly close: () => void;
 }
 
@@ -601,13 +605,35 @@ export function buildApp(deps: ApiDeps): Hono {
   return app;
 }
 
-export function startServer(opts: StartServerOptions): ServerHandle {
-  const app = buildApp(opts.deps);
-  const port = opts.port ?? 8787;
-  const server = serve({ fetch: app.fetch, port });
-  return {
-    close: () => {
-      server.close();
-    },
-  };
+/**
+ * Bind the Hono app to a Node TCP listener. Resolves once the underlying
+ * `server.listen` callback fires, so the returned `port` reflects the
+ * OS-assigned value when the caller passes `0`.
+ *
+ * Hostname is fixed to `127.0.0.1`: the API exposes ledger contents and
+ * habit-mutation verbs and must never be reachable from outside the loopback
+ * interface. SPA / chat clients run on the same host and reach the listener
+ * via 127.0.0.1.
+ */
+export function startServer(
+  deps: ApiDeps,
+  port: number = 8787,
+): Promise<ServerHandle> {
+  const app = buildApp(deps);
+  return new Promise<ServerHandle>((resolvePromise) => {
+    const server = serve(
+      { fetch: app.fetch, port, hostname: "127.0.0.1" },
+      (info) => {
+        // `info` is the AddressInfo returned by server.address(). When the
+        // caller passed port 0 this is the only source of truth for the
+        // actual bound port; when they passed a fixed port it echoes back.
+        resolvePromise({
+          port: info.port,
+          close: () => {
+            server.close();
+          },
+        });
+      },
+    );
+  });
 }
