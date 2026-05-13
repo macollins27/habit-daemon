@@ -20,9 +20,13 @@ export interface Migration {
  *   table-rebuild migrations swap referenced tables safely, the runner
  *   disables FK enforcement BEFORE entering each migration's transaction,
  *   runs the migration, then verifies integrity with `PRAGMA foreign_key_check`
- *   after commit. Any violations introduced by the migration are reported
- *   as an error (fail-closed). FK state is always restored in a `finally`
- *   block, even if the migration throws.
+ *   inside the same transaction. Any violations introduced by the migration
+ *   throw and roll the transaction back (fail-closed). The `_migrations`
+ *   bookkeeping insert also runs inside the transaction, so the schema
+ *   change and its bookkeeping commit atomically — there is no half-state
+ *   window where the schema is applied but the migration is not recorded.
+ *   FK state is always restored in a `finally` block, even if the migration
+ *   throws.
  *
  * Idempotent: calling with the same migration list twice is a no-op the
  * second time.
@@ -50,18 +54,16 @@ export async function runMigrations(
     try {
       const apply = db.transaction((m: Migration) => {
         db.exec(m.up);
+        const violations = db.pragma("foreign_key_check") as ReadonlyArray<unknown>;
+        if (violations.length > 0) {
+          throw new Error(
+            `migration ${m.id} introduced FK violations: ${JSON.stringify(violations)}`
+          );
+        }
+        recordApplied.run(m.id, Date.now());
       });
 
       apply(migration);
-
-      const violations = db.pragma("foreign_key_check") as ReadonlyArray<unknown>;
-      if (violations.length > 0) {
-        throw new Error(
-          `migration ${migration.id} introduced FK violations: ${JSON.stringify(violations)}`
-        );
-      }
-
-      recordApplied.run(migration.id, Date.now());
     } finally {
       db.pragma(prevFk ? "foreign_keys = ON" : "foreign_keys = OFF");
     }
