@@ -163,15 +163,16 @@ function parseTokenResponse(parsed: Record<string, unknown>): Concept2Tokens {
       `Concept2 token response token_type must be Bearer, got ${String(parsed.token_type)}`
     );
   }
-  if (!isNonEmptyString(parsed.scope)) {
-    throw new Error("Concept2 token response missing scope field");
-  }
+  // OAuth 2.0 (RFC 6749 §5.1): the `scope` response field is REQUIRED only
+  // if the granted scope differs from the requested scope. Concept2 omits
+  // it when the grant matches, so we default to the scope we asked for.
+  const scope = isNonEmptyString(parsed.scope) ? parsed.scope : SCOPE;
   return {
     access_token: parsed.access_token,
     refresh_token: parsed.refresh_token,
     expires_at: Date.now() + parsed.expires_in * 1000,
     token_type: "Bearer",
-    scope: parsed.scope,
+    scope,
   };
 }
 

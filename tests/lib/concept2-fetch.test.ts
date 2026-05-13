@@ -546,7 +546,8 @@ describe("refreshTokens()", () => {
     ).rejects.toThrow(/expires_in/);
   });
 
-  it("throws when the response is missing scope", async () => {
+  it("defaults scope to the requested value when the response omits it", async () => {
+    // RFC 6749 §5.1 — see exchangeCodeForTokens counterpart for context.
     const recorder: { calls: RecordedRequest[] } = { calls: [] };
     const fetchImpl = makeMultiFetchMock(
       [
@@ -563,13 +564,12 @@ describe("refreshTokens()", () => {
       recorder
     );
 
-    await expect(
-      refreshTokens({
-        credentials: VALID_CREDS,
-        refreshToken: "RT-original",
-        fetchImpl,
-      })
-    ).rejects.toThrow(/scope/);
+    const tokens = await refreshTokens({
+      credentials: VALID_CREDS,
+      refreshToken: "RT-original",
+      fetchImpl,
+    });
+    expect(tokens.scope).toBe("user:read,results:read");
   });
 
   it("throws when token_type is not Bearer", async () => {

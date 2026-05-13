@@ -384,7 +384,11 @@ describe("exchangeCodeForTokens()", () => {
     ).rejects.toThrow(/expires_in/);
   });
 
-  it("throws when the response is missing scope", async () => {
+  it("defaults scope to the requested value when the response omits it", async () => {
+    // OAuth 2.0 RFC 6749 §5.1: the `scope` response field is REQUIRED only
+    // when the granted scope differs from the requested scope. Concept2
+    // omits the field on identical grants, so the parser must accept the
+    // omission and fall back to the requested scope rather than throw.
     const recorder: { last?: RecordedRequest } = {};
     const fetchImpl = makeFetchMock(
       {
@@ -399,12 +403,11 @@ describe("exchangeCodeForTokens()", () => {
       recorder
     );
 
-    await expect(
-      exchangeCodeForTokens({
-        credentials: VALID_CREDS,
-        code: "X",
-        fetchImpl,
-      })
-    ).rejects.toThrow(/scope/);
+    const tokens = await exchangeCodeForTokens({
+      credentials: VALID_CREDS,
+      code: "X",
+      fetchImpl,
+    });
+    expect(tokens.scope).toBe("user:read,results:read");
   });
 });
