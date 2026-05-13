@@ -11,13 +11,14 @@ import { buildRecord, type AatRecord, type TrustLevel } from "./aat-chain.js";
 export type SessionStatus = "active" | "completed" | "failed" | "aborted";
 
 /**
- * Allowed values for `session_events.event_type`. 15 of these come from the
- * design doc § 2 (habit-daemon-design.md, session_events extension list) and
- * `sensor_failure_logged` comes from Phase A plan Task 15. The SQLite CHECK
- * constraint on `session_events.event_type` is "NULL OR IN (these 16 values)";
- * new code MUST pass one of these literals via `SessionStore.append()`. The
- * column remains nullable to allow infrastructure-level events (carried over
- * from the predecessor fork) that predate this typed taxonomy.
+ * Allowed values for `session_events.event_type`. 16 of these come from the
+ * design doc § 2 + Phase-A plan Task 15 (`sensor_failure_logged`); the final
+ * 6 come from migration `004_chat_and_web_ui.sql` (chat events + habit-CRUD
+ * lifecycle). The SQLite CHECK constraint on `session_events.event_type`
+ * mirrors this union literally; new code MUST pass one of these literals via
+ * `SessionStore.append()`. The column remains nullable to allow
+ * infrastructure-level events (carried over from the predecessor fork) that
+ * predate this typed taxonomy.
  */
 export type SessionEventType =
   // Habit-flow events (8): lifecycle of a single habit run.
@@ -40,7 +41,16 @@ export type SessionEventType =
   | "plan_change_applied"
 
   // Infrastructure events (1): non-habit, non-proposal signal.
-  | "sensor_failure_logged";
+  | "sensor_failure_logged"
+
+  // Chat / web-UI events (6): conversational chat + habit-CRUD lifecycle
+  // (added by migration 004_chat_and_web_ui.sql).
+  | "user_message_received"
+  | "assistant_message_sent"
+  | "habit_created"
+  | "habit_updated"
+  | "habit_archived"
+  | "habit_unarchived";
 
 export interface SessionRow {
   readonly session_id: string;
@@ -109,7 +119,10 @@ export class SessionStore {
           'habit_dodge_requested', 'proof_attempt_rejected', 'proposal_emitted',
           'proposal_applied', 'proposal_rejected', 'proposal_discussion_opened',
           'proposal_discussion_message', 'proposal_resolved', 'plan_change_applied',
-          'sensor_failure_logged'
+          'sensor_failure_logged',
+          'user_message_received', 'assistant_message_sent',
+          'habit_created', 'habit_updated',
+          'habit_archived', 'habit_unarchived'
         )),
         written_iso   TEXT NOT NULL,
         UNIQUE(session_id, seq)
