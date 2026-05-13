@@ -64,6 +64,7 @@ import {
   type StakeName,
   type WellSelection,
 } from "../lib/why-well-selector.js";
+import { checkProvable } from "./check-provable.js";
 
 // -----------------------------------------------------------------------------
 // Per-habit escalation cadence (design § 3).
@@ -702,6 +703,62 @@ export async function runHabitCheckin(
   };
 
   const calloutFired = run.proof_rejection_callout_due === 1;
+
+  // ---------------------------------------------------------------------------
+  // 2.5. Short-circuit when proof is already in cache (Task 2.2).
+  //
+  // If `checkProvable` finds a qualifying sensor row already on file for
+  // (habit, fire_date) — e.g. Concept2 picked up the user's row that
+  // happened before the escalation tick — close the run NOW. No dispatch,
+  // no Discord post, no escalation. The Phase 1 reconciler covers the same
+  // path on its 2-minute cron; this short-circuit makes the close
+  // immediate when habit-checkin races ahead of the reconciler.
+  //
+  // Layering: this block runs BEFORE the defensive defer guard (§ 2a). If
+  // proof is already on file, closing the run takes precedence over
+  // deferring for partial wind-down — the user already did the thing,
+  // there is nothing to defer.
+  //
+  // No Discord post here. Phase 3 owns source-channel acks; the
+  // reconciler's dual-channel post is independent and idempotent (its SQL
+  // excludes completed runs).
+  // ---------------------------------------------------------------------------
+  const provable = checkProvable({
+    db,
+    habitId: habit.id,
+    fireDate: run.fire_date,
+  });
+  if (provable.provable) {
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE habit_runs
+            SET status = 'completed', completed_at = ?
+          WHERE id = ?`,
+      ).run(now, run.id);
+      sessionStore.append(
+        sessionId,
+        "habit_completed",
+        {
+          habitId: habit.id,
+          runId: run.id,
+          completedAt: now,
+          proofPayload: {
+            source: provable.source,
+            session: provable.payload,
+            autoDetected: true,
+          },
+        },
+        { trustLevel: "L1" },
+      );
+    })();
+    return {
+      dispatched: false,
+      messagePosted: false,
+      newLevel: currentLevel,
+      nextEscalationAt: null,
+      calloutFired: false,
+    };
+  }
 
   // ---------------------------------------------------------------------------
   // 2a. Defensive guard (Task 38, design § 3).
