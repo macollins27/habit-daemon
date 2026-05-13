@@ -336,6 +336,83 @@ describe("reconcilePendingRuns()", () => {
     expect(posts).toHaveLength(0);
   });
 
+  it("completes a partial wind-down run when Garmin onset is at or before threshold", async () => {
+    // This is the headline scenario for Task 1.3: the daemon already
+    // observed the "shutting down" typed message (status='partial') and
+    // is awaiting Garmin onset. When the cached Garmin row arrives with
+    // onset ≤ threshold, the reconciler autonomously closes the run.
+    //
+    // This test pins the SQL `IN ('pending','partial')` semantics — if
+    // 'partial' were removed from the loadPendingRuns query, this test
+    // would fail because the row would never be loaded.
+    const db = sessionStore.db;
+    const runId = "test-run-windown-partial-complete";
+    const fireDate = "2026-05-13";
+    const nowMs = Date.parse("2026-05-13T15:00:00Z");
+
+    db.prepare(
+      `INSERT INTO habit_runs (
+         id, habit_id, fire_date, fired_at, current_level, next_escalation_at,
+         status, completed_at, proof_payload_json, skip_reason,
+         proof_rejection_callout_due
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      runId,
+      "wind-down",
+      fireDate,
+      Date.parse("2026-05-13T22:00:00Z"),
+      1,
+      null,
+      "partial",
+      null,
+      null,
+      null,
+      0,
+    );
+
+    // Onset 22:30 ≤ threshold 23:00 → completion.
+    db.prepare(
+      `INSERT INTO sensor_signals (id, source, payload_date, payload_json, fetched_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run(
+      "garmin-2026-05-13",
+      "garmin",
+      fireDate,
+      JSON.stringify({
+        sleep: { sleep_onset_time: "2026-05-13T22:30:00" },
+      }),
+      nowMs,
+    );
+
+    const posts: Array<{ channelId: string; summary: string }> = [];
+
+    const result = await reconcilePendingRuns({
+      sessionStore,
+      now: nowMs,
+      concept2Sync: async () => {},
+      garminSync: async () => {},
+      postCompletion: async (o) =>
+        void posts.push({ channelId: o.channelId, summary: o.summary }),
+    });
+
+    expect(result.attempted).toBe(1);
+    expect(result.completed).toBe(1);
+    expect(result.stillPending).toBe(0);
+
+    const updated = db
+      .prepare("SELECT status, completed_at FROM habit_runs WHERE id = ?")
+      .get(runId) as { status: string; completed_at: number | null };
+    expect(updated.status).toBe("completed");
+    expect(updated.completed_at).toBe(nowMs);
+
+    expect(posts).toHaveLength(2);
+    const channelIds = posts.map((p) => p.channelId).sort();
+    expect(channelIds).toEqual([SEED_CHANNELS.windDown, "wins"].sort());
+    for (const p of posts) {
+      expect(p.summary).toContain("22:30");
+    }
+  });
+
   it("leaves a pending wind-down run untouched when no Garmin row exists", async () => {
     const db = sessionStore.db;
     const runId = "test-run-windown-nodata";

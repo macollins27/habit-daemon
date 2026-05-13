@@ -166,23 +166,29 @@ function loadCachedConcept2Results(
   return parsed.results;
 }
 
-function parseMorningRowConfig(json: string): MorningRowProofConfig {
+function parseMorningRowConfig(
+  json: string,
+  habitId: string,
+): MorningRowProofConfig {
   const parsed = JSON.parse(json) as Record<string, unknown>;
   const minMinutes = parsed.min_minutes;
   if (typeof minMinutes !== "number") {
     throw new Error(
-      "morning-row proof_config_json missing numeric min_minutes",
+      `habit ${habitId} proof_config_json missing numeric min_minutes`,
     );
   }
   return { min_minutes: minMinutes };
 }
 
-function parseWindDownConfig(json: string): WindDownProofConfig {
+function parseWindDownConfig(
+  json: string,
+  habitId: string,
+): WindDownProofConfig {
   const parsed = JSON.parse(json) as Record<string, unknown>;
   const threshold = parsed.stage_b_threshold;
   if (typeof threshold !== "string") {
     throw new Error(
-      "wind-down proof_config_json missing string stage_b_threshold",
+      `habit ${habitId} proof_config_json missing stage_b_threshold string`,
     );
   }
   return { stage_b_threshold: threshold };
@@ -363,7 +369,7 @@ async function reconcileConcept2Row(
   });
 
   const results = loadCachedConcept2Results(db, row.fire_date);
-  const config = parseMorningRowConfig(row.proof_config_json);
+  const config = parseMorningRowConfig(row.proof_config_json, row.habit_id);
   const matched = findQualifyingSession(results, config.min_minutes);
 
   if (matched === undefined) return false;
@@ -403,7 +409,7 @@ async function reconcileWindDownRow(
   const onset = loadGarminOnsetHHMM(db, row.fire_date);
   if (onset === undefined) return false;
 
-  const config = parseWindDownConfig(row.proof_config_json);
+  const config = parseWindDownConfig(row.proof_config_json, row.habit_id);
   // Fixed-width zero-padded HH:MM allows lexicographic comparison.
   // "22:30" <= "23:00" is identical to clock-time comparison.
   if (onset > config.stage_b_threshold) {
