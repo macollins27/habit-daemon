@@ -37,6 +37,7 @@
 //   - src/orchestrate/vision-rejection-counter.ts (sets the callout flag)
 
 import { z } from "zod";
+import type Database from "better-sqlite3";
 import type { SessionStore, SessionEventRow } from "../daemon/session-store.js";
 import {
   postToChannel,
@@ -212,6 +213,79 @@ interface RunRowRaw {
   readonly current_level: number;
   readonly status: string;
   readonly proof_rejection_callout_due: number;
+}
+
+// -----------------------------------------------------------------------------
+// Defensive guard helpers (Task 38).
+//
+// Design § 3 requires two enforcement mechanisms so morning-row L1 never
+// dispatches before wind-down stage-B has been evaluated:
+//   1. `dispatch_priority` on `schedules` — the scheduler tick sorts so
+//      stage-B (priority=10) runs before morning-row (priority=100). Wired
+//      by Task 16 + Task 32 in `schedule-tick`.
+//   2. A defensive guard inside this verb: if invoked for morning-row at L1
+//      while wind-down stage-B is still status='partial' from the previous
+//      night, defer self by 60s without dispatching.
+//
+// The guard runs AFTER habit+run+currentLevel load (so atomicity is preserved
+// for unknown runId) but BEFORE template selection, recent-event loading, and
+// any model dispatch. Its only side effect on the partial-wind-down path is a
+// single-row UPDATE of habit_runs.next_escalation_at — no session_events
+// append, no Discord post, no proof_rejection_callout_due reset.
+// -----------------------------------------------------------------------------
+
+const DEFENSIVE_GUARD_DEFER_MS = 60 * 1000;
+
+// YYYY-MM-DD in process local time. Mirrors `localDateString` in
+// discord-adapter.ts — kept local because (a) it is five lines and (b) a
+// cross-module export for a single use would couple the orchestrate layer
+// to the discord layer for no shared behavior.
+function localDateString(epochMs: number): string {
+  const d = new Date(epochMs);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+interface PartialWindDownRow {
+  readonly _: 1;
+}
+
+function shouldDeferForPartialWindDown(
+  db: Database.Database,
+  habitId: string,
+  currentLevel: number,
+  now: number,
+): boolean {
+  if (habitId !== "morning-row") return false;
+  if (currentLevel !== 1) return false;
+  const yesterday = localDateString(now - 24 * 60 * 60 * 1000);
+  const row = db
+    .prepare(
+      `SELECT 1 AS _
+         FROM habit_runs
+        WHERE habit_id = 'wind-down'
+          AND status = 'partial'
+          AND fire_date = ?
+        LIMIT 1`,
+    )
+    .get(yesterday) as PartialWindDownRow | undefined;
+  return row !== undefined;
+}
+
+function deferForPartialWindDown(
+  db: Database.Database,
+  runId: string,
+  now: number,
+): number {
+  const deferredAt = now + DEFENSIVE_GUARD_DEFER_MS;
+  db.prepare(
+    `UPDATE habit_runs
+        SET next_escalation_at = ?
+      WHERE id = ?`,
+  ).run(deferredAt, runId);
+  return deferredAt;
 }
 
 function parseJsonRecord(s: string, label: string): Record<string, unknown> {
@@ -523,6 +597,37 @@ export async function runHabitCheckin(
   };
 
   const calloutFired = run.proof_rejection_callout_due === 1;
+
+  // ---------------------------------------------------------------------------
+  // 2a. Defensive guard (Task 38, design § 3).
+  //
+  // For morning-row at L1 only: if wind-down stage-B is still status='partial'
+  // from yesterday, defer this verb by 60s. This is belt + suspenders with the
+  // scheduler's dispatch_priority ordering (stage-B priority=10, row L1
+  // priority=100). If the scheduler ordering is bypassed (timing race, missed
+  // cron, manual invocation), the guard absorbs the call so stage-B has
+  // another minute to complete.
+  //
+  // The guard runs BEFORE template selection, cadence resolution, and any
+  // dispatch — so deferral is side-effect-free except for the single-row
+  // UPDATE of habit_runs.next_escalation_at. No session_events row is written
+  // for a deferral; the scheduler simply retries 60s later via the normal
+  // next_escalation_at path.
+  // ---------------------------------------------------------------------------
+  if (shouldDeferForPartialWindDown(db, habit.id, currentLevel, now)) {
+    const deferredAt = deferForPartialWindDown(db, runId, now);
+    process.stderr.write(
+      `[habit-checkin] morning-row L1 deferred 60s for runId=${runId} ` +
+        `(wind-down stage-B partial from previous night)\n`,
+    );
+    return {
+      dispatched: false,
+      messagePosted: false,
+      newLevel: currentLevel,
+      nextEscalationAt: deferredAt,
+      calloutFired: false,
+    };
+  }
 
   // ---------------------------------------------------------------------------
   // 3. Pick template + load recent events + build prompt.
