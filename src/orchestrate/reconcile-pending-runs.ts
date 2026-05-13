@@ -474,3 +474,39 @@ async function postDualChannel(
     );
   }
 }
+
+// -----------------------------------------------------------------------------
+// Cron registration.
+// -----------------------------------------------------------------------------
+
+/**
+ * Idempotently register the reconcile-pending-runs cron in the `schedules`
+ * table. Mirrors `registerRetryUnresolvedSensorsCron`: SELECT-first guard,
+ * INSERT only when no row already exists for this verb. The schedules table
+ * has no UNIQUE(verb) constraint (Phase B).
+ *
+ * Cron contract (Task 1.5):
+ *   - cron_expr: `*\/2 * * * *` (every 2 minutes)
+ *   - args_json: `{}` (the verb takes no per-row args; it scans all pending
+ *     runs whose fire_date matches today)
+ *   - missed_run_policy: skip
+ *   - enabled: 1
+ *   - dispatch_priority: 50 (lower than create-habit-run's 100 so the morning
+ *     fire wins when both want to run on the same tick)
+ */
+export function registerReconcilePendingRunsCron(
+  db: Database.Database,
+): void {
+  const existing = db
+    .prepare(`SELECT id FROM schedules WHERE verb = ?`)
+    .get("reconcile-pending-runs");
+  if (existing !== undefined) {
+    return;
+  }
+
+  db.prepare(
+    `INSERT INTO schedules (
+       cron_expr, verb, args_json, missed_run_policy, enabled, dispatch_priority
+     ) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run("*/2 * * * *", "reconcile-pending-runs", "{}", "skip", 1, 50);
+}
