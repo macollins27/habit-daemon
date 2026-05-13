@@ -22,6 +22,7 @@ import type { SessionStore } from "../daemon/session-store.js";
 import type { Concept2Result } from "../lib/concept2-adapter.js";
 import { findQualifyingSession } from "./verify-proof-internals.js";
 import { ESCALATION_FOLLOW_UP_CONTENT } from "./habit-checkin.js";
+import { onsetBeyondThreshold } from "./evaluate-stage-b.js";
 
 // -----------------------------------------------------------------------------
 // Public surface (pinned in Task 1.1).
@@ -416,9 +417,10 @@ async function reconcileWindDownRow(
   if (onset === undefined) return false;
 
   const config = parseWindDownConfig(row.proof_config_json, row.habit_id);
-  // Fixed-width zero-padded HH:MM allows lexicographic comparison.
-  // "22:30" <= "23:00" is identical to clock-time comparison.
-  if (onset > config.stage_b_threshold) {
+  // onsetBeyondThreshold handles post-midnight bedtimes correctly — naive
+  // lex compare on HH:MM treats "01:25" < "23:00" as true, but going to
+  // sleep at 1:25 AM is past a 23:00 threshold. See evaluate-stage-b.ts.
+  if (onsetBeyondThreshold(onset, config.stage_b_threshold)) {
     // Onset after threshold — the miss-transition lives in
     // evaluateStageB, not here. Leave the row alone.
     return false;
