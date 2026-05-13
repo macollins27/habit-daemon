@@ -91,6 +91,7 @@ interface PendingRunRow {
   readonly id: string;
   readonly habit_id: string;
   readonly fire_date: string;
+  readonly status: string;
   readonly channel_id: string;
   readonly proof_type: string;
   readonly proof_config_json: string;
@@ -108,6 +109,24 @@ interface MorningRowProofConfig {
   readonly min_minutes: number;
 }
 
+interface WindDownProofConfig {
+  readonly stage_b_threshold: string;
+}
+
+interface GarminSleepPayload {
+  readonly sleep: {
+    readonly sleep_onset_time: string | null;
+  } | null;
+}
+
+/**
+ * Loads runs that the reconciler may close out.
+ *
+ * Includes both `status='pending'` (Concept2 morning-row + wind-down
+ * not-yet-typed) AND `status='partial'` (wind-down typed-msg-confirmed,
+ * awaiting Garmin onset). Each per-proof-type branch is responsible for
+ * filtering rows it does not own. See ADR Task 1.3.
+ */
 function loadPendingRuns(
   db: Database.Database,
   today: string,
@@ -117,12 +136,13 @@ function loadPendingRuns(
       `SELECT r.id           AS id,
               r.habit_id     AS habit_id,
               r.fire_date    AS fire_date,
+              r.status       AS status,
               h.channel_id   AS channel_id,
               h.proof_type   AS proof_type,
               h.proof_config_json AS proof_config_json
          FROM habit_runs r
          JOIN habits h ON h.id = r.habit_id
-        WHERE r.status = 'pending'
+        WHERE r.status IN ('pending','partial')
           AND r.fire_date = ?`,
     )
     .all(today) as readonly PendingRunRow[];
@@ -155,6 +175,61 @@ function parseMorningRowConfig(json: string): MorningRowProofConfig {
     );
   }
   return { min_minutes: minMinutes };
+}
+
+function parseWindDownConfig(json: string): WindDownProofConfig {
+  const parsed = JSON.parse(json) as Record<string, unknown>;
+  const threshold = parsed.stage_b_threshold;
+  if (typeof threshold !== "string") {
+    throw new Error(
+      "wind-down proof_config_json missing string stage_b_threshold",
+    );
+  }
+  return { stage_b_threshold: threshold };
+}
+
+/**
+ * Extract HH:MM from an ISO-ish `sleep_onset_time` string
+ * (e.g. "2026-05-12T22:30:00", with or without TZ suffix). Returns
+ * undefined when the string doesn't match. Mirrors `extractHHMM` in
+ * `evaluate-stage-b.ts:185-189` — inlined to keep the reconciler
+ * self-contained (the duplication is one regex; centralisation would
+ * be a separate refactor).
+ */
+function extractHHMM(onset: string): string | undefined {
+  const m = onset.match(/T(\d{2}):(\d{2})/);
+  if (m === null) return undefined;
+  return `${m[1]}:${m[2]}`;
+}
+
+/**
+ * Returns the cached Garmin sleep_onset_time for `fireDate` as HH:MM,
+ * or `undefined` when the sensor_signals row is missing, has no sleep
+ * payload, or the onset doesn't parse. Mirrors `loadGarminOnset` in
+ * evaluate-stage-b.ts.
+ */
+function loadGarminOnsetHHMM(
+  db: Database.Database,
+  fireDate: string,
+): string | undefined {
+  const row = db
+    .prepare(
+      `SELECT payload_json
+         FROM sensor_signals
+        WHERE source = 'garmin' AND payload_date = ?
+        LIMIT 1`,
+    )
+    .get(fireDate) as SensorPayloadRow | undefined;
+  if (row === undefined) return undefined;
+
+  const payload = JSON.parse(row.payload_json) as GarminSleepPayload;
+  if (payload.sleep === null || payload.sleep === undefined) return undefined;
+  if (payload.sleep.sleep_onset_time === null) return undefined;
+  return extractHHMM(payload.sleep.sleep_onset_time);
+}
+
+function formatWindDownSummary(onset: string, threshold: string): string {
+  return `✓ Wind-down · asleep ${onset} (threshold ${threshold})`;
 }
 
 /**
@@ -229,88 +304,31 @@ export async function reconcilePendingRuns(
   let completed = 0;
 
   for (const row of pending) {
-    // Phase 1.2 handles only Concept2-backed morning-row runs. Other
-    // proof types fall through to 1.3+ wiring; for now they remain
-    // pending and the reconciler is a no-op for them.
-    if (row.proof_type !== "concept2_api+photo_fallback") {
-      continue;
+    // Two known proof types are reconcilable today; everything else
+    // (e.g. strength `training_log_photo`) is skipped silently — those
+    // remain a manual-proof path. `attempted` counts only rows the
+    // reconciler took ownership of, so the cron operator's view of
+    // "work attempted vs. closed" is honest.
+    if (row.proof_type === "concept2_api+photo_fallback") {
+      // Concept2 runs only exist in `status='pending'` (no partial
+      // state for morning-row); skip partial rows defensively.
+      if (row.status !== "pending") continue;
+
+      attempted += 1;
+      const didComplete = await reconcileConcept2Row(opts, row);
+      if (didComplete) completed += 1;
+    } else if (row.proof_type === "typed_msg+garmin_sleep") {
+      // Wind-down accepts both `pending` (user has not typed
+      // "shutting down") AND `partial` (typed-msg confirmed, awaiting
+      // Garmin onset). Either way, an at-or-before-threshold Garmin
+      // onset closes the run.
+      if (row.status !== "pending" && row.status !== "partial") continue;
+
+      attempted += 1;
+      const didComplete = await reconcileWindDownRow(opts, row);
+      if (didComplete) completed += 1;
     }
-
-    attempted += 1;
-
-    // Refresh the Concept2 cache. The injected sync function is async and
-    // may throw; per design § 4 + Task 15, sync failures should surface so
-    // the daemon's sensor-failure path can be wired in Task 1.4+. For the
-    // skeleton-plus-Concept2 milestone we let the error propagate.
-    await opts.concept2Sync({
-      habitId: row.habit_id,
-      runId: row.id,
-      date: new Date(opts.now),
-    });
-
-    // Read the (just-refreshed) cached payload. `fire_date` is the
-    // canonical local-date key for both habit_runs and sensor_signals.
-    const results = loadCachedConcept2Results(db, row.fire_date);
-    const config = parseMorningRowConfig(row.proof_config_json);
-    const matched = findQualifyingSession(results, config.min_minutes);
-
-    if (matched === undefined) {
-      continue;
-    }
-
-    const proofPayload = {
-      source: "concept2" as const,
-      session: matched,
-      autoDetected: true,
-    };
-
-    writeCompletion({
-      db,
-      sessionStore: opts.sessionStore,
-      now: opts.now,
-      habitId: row.habit_id,
-      runId: row.id,
-      proofPayload,
-    });
-
-    const summary = formatMorningRowSummary(matched);
-
-    // Post to the source channel (resolved by production wrapper from
-    // habits.channel_id — a Discord snowflake) AND to #wins (a channel
-    // name keyword resolved by the wrapper via adapter.channelIds.wins).
-    // The asymmetry is intentional and is unified by the Task 1.5 wiring.
-    //
-    // The DB write above is irreversible (status is already 'completed').
-    // Each post failure is logged to stderr but MUST NOT abort the batch
-    // or prevent the sibling post — otherwise a flaky channel could leave
-    // the user without an ack AND block reconciliation of remaining rows.
-    // Pattern mirrors `verify-proof.ts:670-682` (Stage-A wind-down ack).
-    try {
-      await opts.postCompletion({
-        channelId: row.channel_id,
-        runId: row.id,
-        summary,
-      });
-    } catch (err: unknown) {
-      console.error(
-        `[reconcile-pending-runs] source-channel ack post failed for run ${row.id}`,
-        err,
-      );
-    }
-    try {
-      await opts.postCompletion({
-        channelId: "wins",
-        runId: row.id,
-        summary,
-      });
-    } catch (err: unknown) {
-      console.error(
-        `[reconcile-pending-runs] wins ack post failed for run ${row.id}`,
-        err,
-      );
-    }
-
-    completed += 1;
+    // else: unknown proof_type — leave untouched, do not count.
   }
 
   return {
@@ -318,4 +336,135 @@ export async function reconcilePendingRuns(
     completed,
     stillPending: attempted - completed,
   };
+}
+
+// -----------------------------------------------------------------------------
+// Per-row branches.
+//
+// Each branch returns `true` when it moved the run to status='completed'
+// this tick, `false` otherwise. The branch is responsible for posting
+// acks (wrapped in independent try/catch — a flaky channel must not
+// abort the batch or block the sibling post).
+// -----------------------------------------------------------------------------
+
+async function reconcileConcept2Row(
+  opts: ReconcileOptions,
+  row: PendingRunRow,
+): Promise<boolean> {
+  const db = opts.sessionStore.db;
+
+  // Refresh the Concept2 cache. The injected sync function is async and
+  // may throw; per design § 4 + Task 15, sync failures should surface
+  // so the daemon's sensor-failure path can be wired in Task 1.4+.
+  await opts.concept2Sync({
+    habitId: row.habit_id,
+    runId: row.id,
+    date: new Date(opts.now),
+  });
+
+  const results = loadCachedConcept2Results(db, row.fire_date);
+  const config = parseMorningRowConfig(row.proof_config_json);
+  const matched = findQualifyingSession(results, config.min_minutes);
+
+  if (matched === undefined) return false;
+
+  const proofPayload = {
+    source: "concept2" as const,
+    session: matched,
+    autoDetected: true,
+  };
+
+  writeCompletion({
+    db,
+    sessionStore: opts.sessionStore,
+    now: opts.now,
+    habitId: row.habit_id,
+    runId: row.id,
+    proofPayload,
+  });
+
+  const summary = formatMorningRowSummary(matched);
+  await postDualChannel(opts, row, summary);
+  return true;
+}
+
+async function reconcileWindDownRow(
+  opts: ReconcileOptions,
+  row: PendingRunRow,
+): Promise<boolean> {
+  const db = opts.sessionStore.db;
+
+  await opts.garminSync({
+    habitId: row.habit_id,
+    runId: row.id,
+    date: new Date(opts.now),
+  });
+
+  const onset = loadGarminOnsetHHMM(db, row.fire_date);
+  if (onset === undefined) return false;
+
+  const config = parseWindDownConfig(row.proof_config_json);
+  // Fixed-width zero-padded HH:MM allows lexicographic comparison.
+  // "22:30" <= "23:00" is identical to clock-time comparison.
+  if (onset > config.stage_b_threshold) {
+    // Onset after threshold — the miss-transition lives in
+    // evaluateStageB, not here. Leave the row alone.
+    return false;
+  }
+
+  const proofPayload = {
+    source: "garmin" as const,
+    sleep_onset: onset,
+    autoDetected: true,
+  };
+
+  writeCompletion({
+    db,
+    sessionStore: opts.sessionStore,
+    now: opts.now,
+    habitId: row.habit_id,
+    runId: row.id,
+    proofPayload,
+  });
+
+  const summary = formatWindDownSummary(onset, config.stage_b_threshold);
+  await postDualChannel(opts, row, summary);
+  return true;
+}
+
+/**
+ * Post a completion ack to the source channel AND #wins. Each post is
+ * wrapped in its own try/catch — the DB write is already committed and
+ * a flaky channel must not prevent the sibling post or abort the batch.
+ * Pattern mirrors `verify-proof.ts:670-682` (Stage-A wind-down ack).
+ */
+async function postDualChannel(
+  opts: ReconcileOptions,
+  row: PendingRunRow,
+  summary: string,
+): Promise<void> {
+  try {
+    await opts.postCompletion({
+      channelId: row.channel_id,
+      runId: row.id,
+      summary,
+    });
+  } catch (err: unknown) {
+    console.error(
+      `[reconcile-pending-runs] source-channel ack post failed for run ${row.id}`,
+      err,
+    );
+  }
+  try {
+    await opts.postCompletion({
+      channelId: "wins",
+      runId: row.id,
+      summary,
+    });
+  } catch (err: unknown) {
+    console.error(
+      `[reconcile-pending-runs] wins ack post failed for run ${row.id}`,
+      err,
+    );
+  }
 }

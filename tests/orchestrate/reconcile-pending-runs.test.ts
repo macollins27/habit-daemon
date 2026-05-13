@@ -183,4 +183,208 @@ describe("reconcilePendingRuns()", () => {
       [SEED_CHANNELS.morningRow, "wins"].sort(),
     );
   });
+
+  // ---------------------------------------------------------------------
+  // Task 1.3: Garmin wind-down branch.
+  //
+  // The wind-down branch handles BOTH `status='pending'` AND
+  // `status='partial'` rows because the daemon may have already
+  // satisfied stage A (typed "shutting down" → status='partial') by the
+  // time the Garmin signal arrives. The branch reads the cached
+  // sensor_signals row, extracts HH:MM from sleep.sleep_onset_time, and
+  // compares against the habit's stage_b_threshold (seeded "23:00").
+  // String comparison works for fixed-width zero-padded HH:MM.
+  //
+  // The reconciler does NOT touch proof_stages — stage A satisfaction
+  // is inferred logically from the Garmin row being present. Stage-B
+  // miss transitions remain evaluateStageB's responsibility.
+  // ---------------------------------------------------------------------
+  it("completes a pending wind-down run when Garmin onset is at or before threshold", async () => {
+    const db = sessionStore.db;
+    const runId = "test-run-windown-1";
+    const fireDate = "2026-05-13";
+    const nowMs = Date.parse("2026-05-13T15:00:00Z");
+
+    db.prepare(
+      `INSERT INTO habit_runs (
+         id, habit_id, fire_date, fired_at, current_level, next_escalation_at,
+         status, completed_at, proof_payload_json, skip_reason,
+         proof_rejection_callout_due
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      runId,
+      "wind-down",
+      fireDate,
+      Date.parse("2026-05-13T22:00:00Z"),
+      1,
+      null,
+      "pending",
+      null,
+      null,
+      null,
+      0,
+    );
+
+    // Onset 22:30 < threshold 23:00 → completion.
+    db.prepare(
+      `INSERT INTO sensor_signals (id, source, payload_date, payload_json, fetched_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run(
+      "garmin-2026-05-13",
+      "garmin",
+      fireDate,
+      JSON.stringify({
+        sleep: { sleep_onset_time: "2026-05-13T22:30:00" },
+      }),
+      nowMs,
+    );
+
+    const posts: Array<{ channelId: string; summary: string }> = [];
+
+    const result = await reconcilePendingRuns({
+      sessionStore,
+      now: nowMs,
+      concept2Sync: async () => {},
+      garminSync: async () => {},
+      postCompletion: async (o) =>
+        void posts.push({ channelId: o.channelId, summary: o.summary }),
+    });
+
+    expect(result.attempted).toBe(1);
+    expect(result.completed).toBe(1);
+    expect(result.stillPending).toBe(0);
+
+    const updated = db
+      .prepare("SELECT status, completed_at FROM habit_runs WHERE id = ?")
+      .get(runId) as { status: string; completed_at: number | null };
+    expect(updated.status).toBe("completed");
+    expect(updated.completed_at).toBe(nowMs);
+
+    expect(posts).toHaveLength(2);
+    const channelIds = posts.map((p) => p.channelId).sort();
+    expect(channelIds).toEqual([SEED_CHANNELS.windDown, "wins"].sort());
+    // The summary must include the onset HH:MM so the operator can
+    // sanity-check the autonomous completion from a #wins glance.
+    for (const p of posts) {
+      expect(p.summary).toContain("22:30");
+    }
+  });
+
+  it("leaves a partial wind-down run partial when Garmin onset is after threshold", async () => {
+    const db = sessionStore.db;
+    const runId = "test-run-windown-late";
+    const fireDate = "2026-05-13";
+    const nowMs = Date.parse("2026-05-13T15:00:00Z");
+
+    // Seed in status='partial' — daemon already saw "shutting down".
+    db.prepare(
+      `INSERT INTO habit_runs (
+         id, habit_id, fire_date, fired_at, current_level, next_escalation_at,
+         status, completed_at, proof_payload_json, skip_reason,
+         proof_rejection_callout_due
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      runId,
+      "wind-down",
+      fireDate,
+      Date.parse("2026-05-13T22:00:00Z"),
+      1,
+      null,
+      "partial",
+      null,
+      null,
+      null,
+      0,
+    );
+
+    // Onset 23:30 > threshold 23:00 → no completion (miss is
+    // evaluateStageB's job, not the reconciler's).
+    db.prepare(
+      `INSERT INTO sensor_signals (id, source, payload_date, payload_json, fetched_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run(
+      "garmin-2026-05-13",
+      "garmin",
+      fireDate,
+      JSON.stringify({
+        sleep: { sleep_onset_time: "2026-05-13T23:30:00" },
+      }),
+      nowMs,
+    );
+
+    const posts: Array<{ channelId: string; summary: string }> = [];
+
+    const result = await reconcilePendingRuns({
+      sessionStore,
+      now: nowMs,
+      concept2Sync: async () => {},
+      garminSync: async () => {},
+      postCompletion: async (o) =>
+        void posts.push({ channelId: o.channelId, summary: o.summary }),
+    });
+
+    expect(result.attempted).toBe(1);
+    expect(result.completed).toBe(0);
+    expect(result.stillPending).toBe(1);
+
+    const updated = db
+      .prepare("SELECT status, completed_at FROM habit_runs WHERE id = ?")
+      .get(runId) as { status: string; completed_at: number | null };
+    expect(updated.status).toBe("partial");
+    expect(updated.completed_at).toBeNull();
+
+    expect(posts).toHaveLength(0);
+  });
+
+  it("leaves a pending wind-down run untouched when no Garmin row exists", async () => {
+    const db = sessionStore.db;
+    const runId = "test-run-windown-nodata";
+    const fireDate = "2026-05-13";
+    const nowMs = Date.parse("2026-05-13T15:00:00Z");
+
+    db.prepare(
+      `INSERT INTO habit_runs (
+         id, habit_id, fire_date, fired_at, current_level, next_escalation_at,
+         status, completed_at, proof_payload_json, skip_reason,
+         proof_rejection_callout_due
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      runId,
+      "wind-down",
+      fireDate,
+      Date.parse("2026-05-13T22:00:00Z"),
+      1,
+      null,
+      "pending",
+      null,
+      null,
+      null,
+      0,
+    );
+
+    // NOTE: no sensor_signals row for garmin / 2026-05-13.
+
+    const posts: Array<{ channelId: string; summary: string }> = [];
+
+    const result = await reconcilePendingRuns({
+      sessionStore,
+      now: nowMs,
+      concept2Sync: async () => {},
+      garminSync: async () => {},
+      postCompletion: async (o) =>
+        void posts.push({ channelId: o.channelId, summary: o.summary }),
+    });
+
+    expect(result.attempted).toBe(1);
+    expect(result.completed).toBe(0);
+    expect(result.stillPending).toBe(1);
+
+    const updated = db
+      .prepare("SELECT status, completed_at FROM habit_runs WHERE id = ?")
+      .get(runId) as { status: string; completed_at: number | null };
+    expect(updated.status).toBe("pending");
+    expect(updated.completed_at).toBeNull();
+
+    expect(posts).toHaveLength(0);
+  });
 });
