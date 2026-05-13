@@ -114,6 +114,24 @@ export function buildApp(deps: ApiDeps): Hono {
     return c.json({ habits });
   });
 
+  // GET /api/habits/:id — fetch a single habit.
+  //
+  // Returns archived rows too: callers that drill in by id (e.g. an
+  // unarchive UI) need to see the row regardless of `archived_at`.
+  // 404 with a structured `{ error }` body when the id is unknown so
+  // the chat / web UI can surface a clean message without trying to
+  // parse an empty response.
+  app.get("/api/habits/:id", (c) => {
+    const id = c.req.param("id");
+    const row = deps.sessionStore.db
+      .prepare(`SELECT * FROM habits WHERE id = ?`)
+      .get(id) as Record<string, unknown> | undefined;
+    if (row === undefined) {
+      return c.json({ error: `unknown habit id: ${id}` }, 404);
+    }
+    return c.json(serializeHabit(row));
+  });
+
   return app;
 }
 
