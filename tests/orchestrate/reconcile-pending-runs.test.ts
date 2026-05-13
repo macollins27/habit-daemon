@@ -103,4 +103,84 @@ describe("reconcilePendingRuns() — skeleton", () => {
       stillPending: 0,
     });
   });
+
+  it("marks a pending morning-row run completed when Concept2 has a qualifying session", async () => {
+    // -----------------------------------------------------------------
+    // Setup: pending morning-row run on the local date matching `now`
+    // (2026-05-13), AND a cached sensor_signals row keyed the same way.
+    //
+    // The cached payload must use the post-boundary-transform shape
+    // (`duration_seconds` / `distance_meters` / ISO date) since commit
+    // e6a69c7 made sync write transformed shapes — the reconciler reads
+    // the cached row directly, so it sees transformed data.
+    // -----------------------------------------------------------------
+    const db = sessionStore.db;
+    const runId = "test-run-1";
+    const fireDate = "2026-05-13";
+    const nowMs = Date.parse("2026-05-13T15:00:00Z");
+
+    db.prepare(
+      `INSERT INTO habit_runs (
+         id, habit_id, fire_date, fired_at, current_level, next_escalation_at,
+         status, completed_at, proof_payload_json, skip_reason,
+         proof_rejection_callout_due
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      runId,
+      "morning-row",
+      fireDate,
+      Date.parse("2026-05-13T09:05:00Z"),
+      1,
+      null,
+      "pending",
+      null,
+      null,
+      null,
+      0,
+    );
+
+    const qualifyingSession = {
+      id: 999,
+      date: "2026-05-13 09:35:00",
+      type: "rower",
+      duration_seconds: 603.3,
+      distance_meters: 2279,
+    };
+    db.prepare(
+      `INSERT INTO sensor_signals (id, source, payload_date, payload_json, fetched_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run(
+      "concept2-2026-05-13",
+      "concept2",
+      fireDate,
+      JSON.stringify({ results: [qualifyingSession] }),
+      nowMs,
+    );
+
+    const posts: Array<{ channelId: string; summary: string }> = [];
+
+    const result = await reconcilePendingRuns({
+      sessionStore,
+      now: nowMs,
+      concept2Sync: async () => {},
+      garminSync: async () => {},
+      postCompletion: async (o) =>
+        void posts.push({ channelId: o.channelId, summary: o.summary }),
+    });
+
+    expect(result.attempted).toBe(1);
+    expect(result.completed).toBe(1);
+
+    const updated = db
+      .prepare("SELECT status, completed_at FROM habit_runs WHERE id = ?")
+      .get(runId) as { status: string; completed_at: number | null };
+    expect(updated.status).toBe("completed");
+    expect(updated.completed_at).toBe(nowMs);
+
+    expect(posts).toHaveLength(2);
+    const channelIds = posts.map((p) => p.channelId).sort();
+    expect(channelIds).toEqual(
+      [SEED_CHANNELS.morningRow, "wins"].sort(),
+    );
+  });
 });
