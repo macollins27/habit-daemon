@@ -89,10 +89,13 @@ def cmd_login() -> None:
 
 def cmd_fetch(args: argparse.Namespace) -> None:
     """Real fetch: load cached tokens, call get_sleep_data, project fields."""
-    fields = parse_fields(args.fields)
-    if not fields:
-        sys.stderr.write("--fields is required and must be non-empty\n")
-        sys.exit(1)
+    if not args.print_raw:
+        fields = parse_fields(args.fields)
+        if not fields:
+            sys.stderr.write("--fields is required and must be non-empty\n")
+            sys.exit(1)
+    else:
+        fields = []
 
     try:
         from garminconnect import Garmin  # type: ignore[import-not-found]
@@ -113,6 +116,10 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     except Exception as exc:  # noqa: BLE001
         sys.stderr.write(f"Network or API error: {exc}\n")
         sys.exit(3)
+
+    if args.print_raw:
+        sys.stdout.write(json.dumps(raw, indent=2, default=str))
+        sys.exit(0)
 
     if not raw:
         sys.stdout.write("{}")
@@ -146,6 +153,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--fields",
         help="Comma-separated list of fields to project from the response.",
     )
+    parser.add_argument(
+        "--print-raw",
+        action="store_true",
+        help="Print the raw Garmin response without projection (debug only). Requires --date.",
+    )
     return parser
 
 
@@ -163,6 +175,10 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(1)
         cmd_stub(args)
         return
+
+    if args.print_raw and not args.date:
+        sys.stderr.write("--print-raw requires --date\n")
+        sys.exit(1)
 
     if args.date:
         cmd_fetch(args)
