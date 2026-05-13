@@ -70,12 +70,41 @@ export interface LevelTemplate {
   readonly outputSchema: string;
 }
 
+/**
+ * Live sensor context — last night's Garmin payload and the most recent
+ * Concept2 session payload. Optional: when omitted the prompt simply does
+ * not include the Sensor context block. The model is given the raw JSON
+ * and trusted to cite specific fields (sleep_duration_min, distance_meters,
+ * etc.) per the L1 voice rules. Bounded by the caller (typically 1 row
+ * each) to keep prompt size reasonable.
+ */
+export interface SensorSnapshot {
+  readonly garminLastNight?: Record<string, unknown> | null;
+  readonly concept2LastSession?: Record<string, unknown> | null;
+}
+
+/**
+ * Recent miss-pattern snapshot — last N miss_reasons rows for this habit.
+ * Used by L1 to pre-empt the user's likely rationalization ("you said
+ * 'later' on three of the last seven Mondays"). The orchestrator is
+ * responsible for filtering to the relevant habit + window.
+ */
+export interface RecentMissesSnapshot {
+  readonly misses: ReadonlyArray<{
+    readonly miss_date: string;
+    readonly classification: string | null;
+    readonly inferred_specifics: string | null;
+  }>;
+}
+
 export interface PromptBuildOptions {
   readonly habit: HabitContext;
   readonly run: RunContext;
   readonly currentLevel: number;
   readonly recentEvents: readonly SessionEventRow[];
   readonly levelTemplate: LevelTemplate;
+  readonly sensorSnapshot?: SensorSnapshot;
+  readonly recentMisses?: RecentMissesSnapshot;
 }
 
 function formatFiredAt(epochMs: number): string {
@@ -154,6 +183,33 @@ function buildRunContextBlock(run: RunContext): string {
   ].join("\n");
 }
 
+function buildSensorContextBlock(snap: SensorSnapshot): string {
+  const lines: string[] = ["Sensor context (real numbers — cite specific fields, don't invent):"];
+  if (snap.garminLastNight && Object.keys(snap.garminLastNight).length > 0) {
+    lines.push(`  Garmin last night: ${JSON.stringify(snap.garminLastNight)}`);
+  } else {
+    lines.push("  Garmin last night: (none — do not claim sleep numbers you don't have)");
+  }
+  if (snap.concept2LastSession && Object.keys(snap.concept2LastSession).length > 0) {
+    lines.push(`  Concept2 most recent session: ${JSON.stringify(snap.concept2LastSession)}`);
+  } else {
+    lines.push("  Concept2 most recent session: (none — do not invent splits or distances)");
+  }
+  return lines.join("\n");
+}
+
+function buildRecentMissesBlock(snap: RecentMissesSnapshot): string {
+  if (snap.misses.length === 0) {
+    return "Recent misses for this habit: (none in the lookback window)";
+  }
+  const lines = snap.misses.map(
+    (m) =>
+      `  - ${m.miss_date}: classification=${m.classification ?? "(none)"}` +
+      (m.inferred_specifics ? `, specifics=${m.inferred_specifics}` : ""),
+  );
+  return ["Recent misses for this habit (most recent first — use to pre-empt rationalization):", ...lines].join("\n");
+}
+
 /**
  * Compose the habit-checkin system prompt.
  *
@@ -183,6 +239,12 @@ export function buildHabitCheckinPrompt(opts: PromptBuildOptions): string {
 
   sections.push(buildHabitContextBlock(habit));
   sections.push(buildRunContextBlock(run));
+  if (opts.sensorSnapshot) {
+    sections.push(buildSensorContextBlock(opts.sensorSnapshot));
+  }
+  if (opts.recentMisses) {
+    sections.push(buildRecentMissesBlock(opts.recentMisses));
+  }
   sections.push(buildRecentEventsBlock(recentEvents));
   sections.push(levelTemplate.voiceRules);
   sections.push(

@@ -469,6 +469,40 @@ function loadMissReasons30d(
   }));
 }
 
+/**
+ * Load the most recent sensor_signals payload for the given source (parsed).
+ * Returns null if no row exists OR if the payload is unparseable. Used by
+ * runHabitCheckin to feed last-night Garmin + latest Concept2 session into
+ * the prompt so the L1 model can cite real numbers.
+ */
+function loadLatestSensorPayload(
+  sessionStore: SessionStore,
+  source: "garmin" | "concept2",
+): Record<string, unknown> | null {
+  const row = sessionStore.db
+    .prepare(
+      `SELECT payload_json, payload_date, fetched_at
+         FROM sensor_signals
+        WHERE source = ?
+        ORDER BY payload_date DESC, fetched_at DESC
+        LIMIT 1`,
+    )
+    .get(source) as { payload_json: string; payload_date: string; fetched_at: number } | undefined;
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.payload_json) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    // Augment with the metadata so the model knows when this data was captured.
+    return {
+      ...(parsed as Record<string, unknown>),
+      _payload_date: row.payload_date,
+      _fetched_at_iso: new Date(row.fetched_at).toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
 function loadGarminSignals30d(
   sessionStore: SessionStore,
   now: number,
@@ -776,12 +810,32 @@ export async function runHabitCheckin(
 
   const recentEvents = loadRecentEventsForHabit(sessionStore, habit.id);
 
+  // Always-on context for the model: last night's Garmin payload, the most
+  // recent Concept2 session, and recent miss_reasons. The model is given
+  // raw JSON and trusted to cite specific fields per the L1 voice rules
+  // (which forbid invented numbers). This data is what makes L1 hit on
+  // the first message instead of reading like a generic notification.
+  const garminLastNight = loadLatestSensorPayload(sessionStore, "garmin");
+  const concept2LastSession = loadLatestSensorPayload(sessionStore, "concept2");
+  const recentMissesSnapshot = {
+    misses: loadMissReasons30d(sessionStore, habit.id, now).map((m) => ({
+      miss_date: m.miss_date,
+      classification: m.classification,
+      inferred_specifics: m.inferred_specifics,
+    })),
+  };
+
   const prompt = buildHabitCheckinPrompt({
     habit,
     run,
     currentLevel,
     recentEvents,
     levelTemplate,
+    sensorSnapshot: {
+      garminLastNight,
+      concept2LastSession,
+    },
+    recentMisses: recentMissesSnapshot,
   });
 
   // ---------------------------------------------------------------------------
