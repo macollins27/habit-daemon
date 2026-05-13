@@ -25,6 +25,7 @@ import { serve } from "@hono/node-server";
 import { z } from "zod";
 import type { SessionStore } from "../daemon/session-store.js";
 import { serializeHabit, type HabitResponse } from "./serialize.js";
+import { computeStats, type HabitRunForStats } from "./stats.js";
 
 // Bounded limit for the /runs endpoint. Defaults to 30, max 365 — values
 // outside the range are clamped (not rejected) so a UI passing an
@@ -201,6 +202,29 @@ export function buildApp(deps: ApiDeps): Hono {
       ? stmt.all(id, since, limit)
       : stmt.all(id, limit)) as ReadonlyArray<HabitRunRow>;
     return c.json({ runs: rows });
+  });
+
+  // GET /api/habits/:id/stats — completion-rate + streak math.
+  //
+  // SELECTs the entire run history (no LIMIT) so streak math sees the
+  // full sequence. For habits with thousands of runs this would warrant
+  // a server-side rollup; Phase A volumes are well below that bar.
+  // 404 surfaces an unknown habit id distinct from "habit exists but
+  // has zero runs" (which returns zeros).
+  app.get("/api/habits/:id/stats", (c) => {
+    const id = c.req.param("id");
+    const habit = deps.sessionStore.db
+      .prepare(`SELECT id FROM habits WHERE id = ?`)
+      .get(id) as { id: string } | undefined;
+    if (habit === undefined) {
+      return c.json({ error: `unknown habit id: ${id}` }, 404);
+    }
+    const rows = deps.sessionStore.db
+      .prepare(
+        `SELECT fire_date, status FROM habit_runs WHERE habit_id = ?`,
+      )
+      .all(id) as ReadonlyArray<HabitRunForStats>;
+    return c.json(computeStats(rows));
   });
 
   return app;
