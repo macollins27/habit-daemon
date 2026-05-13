@@ -73,31 +73,69 @@ import {
 // to schedule L2 we ask for delta(habitId, 1). Encoded for L1..L4 here so
 // later tasks (L2/L3/L4 templates) can reuse the same table. wind-down has
 // no L4→L5 entry because design § 3 says L4 is its terminal level.
+//
+// User-created habits (id = `habit_<slug>` per createHabit) are NOT in this
+// per-habit map. They fall through to `DEFAULT_ESCALATION_DELTA_MINUTES`
+// below — without that fallback the first scheduler tick on any user-created
+// habit throws inside this verb. Same shape as the channel-routing bug
+// fixed in commit 319305f: a closed map keyed on the three Phase-A seed
+// habit ids was load-bearing for arbitrary user slugs.
 // -----------------------------------------------------------------------------
 
 const ESCALATION_DELTA_MINUTES: Readonly<
-  Record<string, Readonly<Record<number, number>>>
+  Record<string, Readonly<Record<number, number | null>>>
 > = {
-  "morning-row": { 1: 30, 2: 30, 3: 30, 4: 30 },
-  "strength-mwf": { 1: 30, 2: 30, 3: 30, 4: 30 },
+  "morning-row": { 1: 30, 2: 30, 3: 30, 4: 30, 5: null },
+  "strength-mwf": { 1: 30, 2: 30, 3: 30, 4: 30, 5: null },
+  // wind-down has no L4 or L5 entry — design § 3 closes the window at L4
+  // (Task 36/37 owns terminal-state evaluation). Keeping the table sparse
+  // preserves the existing fail-fast contract for (wind-down, fromLevel>=4).
   "wind-down": { 1: 8, 2: 5, 3: 2 },
-};
+} as const;
+
+// Default escalation cadence for any habit not enumerated above (user-created
+// habits + any future habit added without its own row). Same shape as the
+// per-habit tables: keys are the level that is CURRENTLY firing; the value is
+// the minutes-to-wait before the next escalation. `null` at L5 signals the
+// terminal step — `runHabitCheckin` separately interprets currentLevel===5 as
+// terminal and writes `next_escalation_at = NULL`, so this null is documented
+// rather than load-bearing on the happy path.
+const DEFAULT_ESCALATION_DELTA_MINUTES: Readonly<
+  Record<number, number | null>
+> = {
+  1: 10,
+  2: 15,
+  3: 30,
+  4: 60,
+  5: null,
+} as const;
 
 export function getEscalationDeltaMinutes(
   habitId: string,
   fromLevel: number,
-): number {
+): number | null {
   const habitMap = ESCALATION_DELTA_MINUTES[habitId];
-  if (habitMap === undefined) {
-    throw new Error(`Unknown habit id for escalation table: ${habitId}`);
+  if (habitMap !== undefined) {
+    const delta = habitMap[fromLevel];
+    if (delta === undefined) {
+      // Known habit with an explicit gap in the table — e.g. wind-down has
+      // no L4 entry per design § 3. Fail-fast preserves Task 30's contract
+      // that an unsupported (habit, level) combination throws atomically.
+      throw new Error(
+        `No escalation delta defined for habit=${habitId} fromLevel=${fromLevel}`,
+      );
+    }
+    return delta;
   }
-  const delta = habitMap[fromLevel];
-  if (delta === undefined) {
+  // Unknown habit id — user-created habit or any future addition without its
+  // own row. Fall back to the default cadence. `null` at L5 signals terminal.
+  const defaultDelta = DEFAULT_ESCALATION_DELTA_MINUTES[fromLevel];
+  if (defaultDelta === undefined) {
     throw new Error(
-      `No escalation delta defined for habit=${habitId} fromLevel=${fromLevel}`,
+      `No default escalation delta defined for fromLevel=${fromLevel}`,
     );
   }
-  return delta;
+  return defaultDelta;
 }
 
 // -----------------------------------------------------------------------------
@@ -716,9 +754,25 @@ export async function runHabitCheckin(
   // L5 skips the lookup entirely: there is no L5→L6 entry in the cadence
   // table because L5 is terminal. The DB transaction sets
   // next_escalation_at = NULL directly.
-  const deltaMinutes = isTerminalLevel
-    ? 0
-    : getEscalationDeltaMinutes(habit.id, currentLevel);
+  //
+  // `getEscalationDeltaMinutes` returns `number | null` so that callers can
+  // distinguish "no further escalation" (null) from a real delta. On the
+  // non-terminal branch we narrow null → throw, because L1..L4 must always
+  // resolve to a real cadence — null at L1..L4 indicates a misconfigured
+  // habit row that the verb should refuse atomically.
+  let deltaMinutes: number;
+  if (isTerminalLevel) {
+    deltaMinutes = 0;
+  } else {
+    const resolved = getEscalationDeltaMinutes(habit.id, currentLevel);
+    if (resolved === null) {
+      throw new Error(
+        `habit-checkin: getEscalationDeltaMinutes returned null at ` +
+          `non-terminal level for habit=${habit.id} fromLevel=${currentLevel}`,
+      );
+    }
+    deltaMinutes = resolved;
+  }
 
   const recentEvents = loadRecentEventsForHabit(sessionStore, habit.id);
 
