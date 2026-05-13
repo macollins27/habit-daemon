@@ -8,3 +8,6 @@ habit-state.db*
 docs/*
 !docs/decisions/
 !docs/decisions/**
+!docs/retros/
+docs/retros/*
+!docs/retros/phase-A-retro-template.md
