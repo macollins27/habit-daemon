@@ -188,12 +188,17 @@ async function dispatchClaudeForCheckin(opts: {
     prompt: opts.prompt,
     jsonSchema: opts.jsonSchema,
     allowedTools: [],
-    maxTurns: 1,
+    // Bumped from 1: `--setting-sources user,project` inherits user-level skills
+    // (e.g. superpowers:using-superpowers) that auto-invoke on conversation start
+    // and produce a tool_use turn. With maxTurns=1, claude hits error_max_turns
+    // before composing the structured-output response. 3 gives budget for: skill
+    // invocation attempt → tool_use denied (allowedTools is empty) → final compose.
+    maxTurns: 3,
     maxBudgetUsd: 0.1,
   });
   if (result.status !== "success" && result.status !== "dry_run") {
     return {
-      error: `claude -p exited ${result.status}: ${(result.stderr ?? "").slice(0, 500)}`,
+      error: `claude -p exited ${result.status} (code=${result.exitCode}): stderr=${(result.stderr ?? "").slice(0, 600)} | stdout=${(result.stdout ?? "").slice(0, 600)}`,
     };
   }
   const env = parseClaudeEnvelope(result.stdout);
