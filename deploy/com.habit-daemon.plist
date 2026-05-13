@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.habit-daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>/opt/habit-daemon/dist/daemon/scheduler-daemon.js</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/opt/habit-daemon</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NODE_ENV</key>
+        <string>production</string>
+        <!-- Other env vars are sourced from ~/.habit-daemon/env at daemon startup
+             via the bootstrap code (not yet wired - Phase A retro item). -->
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/maxwellcollins/.habit-daemon/logs/stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/maxwellcollins/.habit-daemon/logs/stderr.log</string>
+</dict>
+</plist>
