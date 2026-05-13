@@ -54,6 +54,63 @@ def project_fields(data: dict, fields: list[str]) -> dict:
     return {k: data[k] for k in fields if k in data}
 
 
+def project_real_sleep(raw: dict) -> dict:
+    """Map Garmin Connect's daily-sleep DTO to the daemon-side field names.
+
+    Real shape (captured 2026-05-13, sanitized fixture at
+    tests/fixtures/garmin/sleep-response-real.json):
+
+        raw["dailySleepDTO"] = {
+            "sleepStartTimestampLocal": <epoch ms — wall-clock as if UTC>,
+            "sleepTimeSeconds": int,
+            "remSleepSeconds": int,
+            "deepSleepSeconds": int,
+            ...37 fields total...
+        }
+
+    Garmin's "local" timestamp encodes wall-clock time as epoch-ms-as-if-UTC,
+    so utcfromtimestamp() yields the correct local ISO string. The reconciler's
+    extractHHMM regex matches `T(HH):(MM)` so ISO format is required.
+
+    HRV is NOT in get_sleep_data (it's in get_hrv_data, a different endpoint).
+    Stub mode surfaces hrv; real fetches omit it. A future follow-up can wire
+    get_hrv_data + merge.
+
+    Returns a dict with only the daemon-side fields that could be derived from
+    the input. Fields whose source is missing or wrong-typed are silently
+    skipped — the reconciler treats absent sleep_onset_time as "no data".
+    """
+    from datetime import datetime, timezone
+
+    dto = raw.get("dailySleepDTO") or {}
+    result: dict[str, object] = {}
+
+    onset_ms = dto.get("sleepStartTimestampLocal")
+    if isinstance(onset_ms, (int, float)) and onset_ms > 0:
+        # Garmin's "local" timestamp is epoch-ms whose value, when interpreted
+        # as UTC, equals the user's wall-clock time. Parse as UTC then drop
+        # the tz so the ISO string matches the daemon's local-time convention.
+        result["sleep_onset_time"] = (
+            datetime.fromtimestamp(onset_ms / 1000, tz=timezone.utc)
+            .replace(tzinfo=None)
+            .isoformat()
+        )
+
+    total_s = dto.get("sleepTimeSeconds")
+    if isinstance(total_s, (int, float)):
+        result["total_sleep_minutes"] = round(total_s / 60)
+
+    rem_s = dto.get("remSleepSeconds")
+    if isinstance(rem_s, (int, float)):
+        result["rem_minutes"] = round(rem_s / 60)
+
+    deep_s = dto.get("deepSleepSeconds")
+    if isinstance(deep_s, (int, float)):
+        result["deep_sleep_minutes"] = round(deep_s / 60)
+
+    return result
+
+
 def cmd_stub(args: argparse.Namespace) -> None:
     """Stub mode: print canned JSON and exit 0. Does NOT import garminconnect."""
     fields = parse_fields(args.fields)
@@ -136,8 +193,10 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         sys.stdout.write("{}")
         sys.exit(0)
 
-    projection = project_fields(raw, fields)
-    sys.stdout.write(json.dumps(projection))
+    # Two-step: real-DTO → daemon-side names → caller-requested subset.
+    projected = project_real_sleep(raw)
+    final = project_fields(projected, fields)
+    sys.stdout.write(json.dumps(final))
     sys.exit(0)
 
 
