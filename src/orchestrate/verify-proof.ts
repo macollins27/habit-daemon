@@ -45,6 +45,7 @@ import {
   verifyImage,
   type DispatchResult as VisionDispatchResult,
 } from "../lib/vision-verify.js";
+import { findQualifyingSession } from "./verify-proof-internals.js";
 
 // -----------------------------------------------------------------------------
 // Type contracts.
@@ -307,22 +308,6 @@ function loadCachedConcept2Results(
   }
   const parsed = JSON.parse(row.payload_json) as Concept2Payload;
   return parsed.results;
-}
-
-/**
- * Pick the first rower session whose duration meets the min-minutes floor.
- * Phase A: only `type === 'rower'` qualifies (the design's "morning row"
- * habit is PM5-specific). Future rower types ('erg', 'skierg', etc.) are
- * intentionally excluded; revisit if the design adds cross-modal proof.
- */
-function findQualifyingSession(
-  results: readonly Concept2Result[],
-  minMinutes: number,
-): Concept2Result | undefined {
-  const minSeconds = minMinutes * 60;
-  return results.find(
-    (r) => r.type === "rower" && r.duration_seconds >= minSeconds,
-  );
 }
 
 /**

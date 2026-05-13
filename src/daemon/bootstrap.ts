@@ -64,6 +64,10 @@ import {
   retryUnresolvedSensors,
   registerRetryUnresolvedSensorsCron,
 } from "../orchestrate/retry-unresolved-sensors.js";
+import {
+  reconcilePendingRuns,
+  registerReconcilePendingRunsCron,
+} from "../orchestrate/reconcile-pending-runs.js";
 import { handleProofMessage } from "../orchestrate/handle-proof-message.js";
 import type { DispatchFn } from "./scheduler.js";
 
@@ -165,7 +169,13 @@ function localDateString(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-interface DispatchDeps {
+/**
+ * Exported for tests in `tests/daemon/` that exercise dispatch routes
+ * without spinning up the full bootstrap (Discord login + env file).
+ * Production callers go through `bootstrap()`, which constructs the same
+ * shape internally.
+ */
+export interface DispatchDeps {
   readonly ledger: Ledger;
   readonly adapter: DiscordAdapter;
   readonly sessionId: string;
@@ -208,9 +218,10 @@ async function dispatchClaudeForCheckin(opts: {
 
 /**
  * Production dispatch map: verb name → in-process orchestration verb. Called
- * by scheduler-daemon.ts's dispatch callback.
+ * by scheduler-daemon.ts's dispatch callback. Exported so daemon-wiring
+ * tests can exercise individual dispatch routes against stubbed deps.
  */
-function makeInProcessDispatch(deps: DispatchDeps): DispatchFn {
+export function makeInProcessDispatch(deps: DispatchDeps): DispatchFn {
   return async (verb: string, argsJson: string): Promise<void> => {
     const args = JSON.parse(argsJson) as Record<string, unknown>;
     const now = Date.now();
@@ -301,6 +312,82 @@ function makeInProcessDispatch(deps: DispatchDeps): DispatchFn {
         return;
       }
 
+      case "reconcile-pending-runs": {
+        // TZ-aligned Concept2 wrapper. The reconciler reads sensor_signals
+        // keyed by row.fire_date (local YYYY-MM-DD). concept2SyncDate
+        // writes payload_date via toIsoDate(d) = d.toISOString().slice(0,10)
+        // which is the UTC date. To make the two keys agree, we pin the
+        // Date at UTC midnight of the LOCAL date — that way the UTC slice
+        // equals the local YYYY-MM-DD that fire_date uses. See ADR 0001.
+        const concept2Sync = async ({
+          date,
+        }: {
+          habitId: string;
+          runId: string;
+          date: Date;
+        }): Promise<void> => {
+          const localStr = localDateString(date);
+          const dateForSync = new Date(`${localStr}T00:00:00Z`);
+          await concept2SyncDate({
+            db: deps.ledger.sessionStore.db,
+            date: dateForSync,
+            credentials: deps.concept2.credentials,
+            tokens: deps.concept2.tokens,
+            onTokensRefreshed: (newTokens) => {
+              deps.concept2.tokens = newTokens;
+              saveConcept2Tokens(newTokens);
+            },
+          });
+        };
+        // Garmin's syncDate already takes a YYYY-MM-DD string. The
+        // reconciler hands us a Date — translate to the local date so
+        // sensor_signals.payload_date matches habit_runs.fire_date.
+        const garminSync = async ({
+          date,
+        }: {
+          habitId: string;
+          runId: string;
+          date: Date;
+        }): Promise<void> => {
+          const localStr = localDateString(date);
+          await garminSyncDate({
+            db: deps.ledger.sessionStore.db,
+            date: localStr,
+            pythonBin: join(homedir(), ".habit-daemon", "venv", "bin", "python"),
+          });
+        };
+        // postToChannel accepts either a ChannelName keyword (looked up in
+        // adapter.channelIds) or a raw snowflake (passed verbatim to
+        // client.channels.fetch). The reconciler emits "wins" for the wins
+        // post and the habit row's snowflake for the source-channel post —
+        // both pass through unchanged. See src/lib/discord-adapter.ts:239+.
+        const postCompletion = async ({
+          channelId,
+          summary,
+        }: {
+          channelId: string;
+          runId: string;
+          summary: string;
+        }): Promise<void> => {
+          await postToChannel({
+            adapter: deps.adapter,
+            channel: channelId,
+            content: summary,
+          });
+        };
+        const result = await reconcilePendingRuns({
+          sessionStore: deps.ledger.sessionStore,
+          now,
+          concept2Sync,
+          garminSync,
+          postCompletion,
+        });
+        logInfo(
+          `reconcile-pending-runs: attempted=${String(result.attempted)} completed=${String(result.completed)} stillPending=${String(result.stillPending)}`,
+        );
+        return;
+      }
+
       default:
         throw new Error(`Unknown verb: ${verb}`);
     }
@@ -385,8 +472,9 @@ export async function bootstrap(): Promise<BootstrapResult> {
   const habitCrons = registerHabitMorningCrons(db);
   registerEvaluateStageBCron(db);
   registerRetryUnresolvedSensorsCron(db);
+  registerReconcilePendingRunsCron(db);
   logInfo(
-    `cron rows registered: ${String(habitCrons)} habit fires + evaluate-stage-b + retry-unresolved-sensors`,
+    `cron rows registered: ${String(habitCrons)} habit fires + evaluate-stage-b + retry-unresolved-sensors + reconcile-pending-runs`,
   );
 
   // Open a daemon-process session.
