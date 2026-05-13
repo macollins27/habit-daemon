@@ -21,6 +21,10 @@ import type Database from "better-sqlite3";
 import type { SessionStore } from "../daemon/session-store.js";
 import type { Concept2Result } from "../lib/concept2-adapter.js";
 import { localDateString } from "../lib/local-date.js";
+import {
+  parseMorningRowConfig,
+  parseWindDownConfig,
+} from "./proof-config.js";
 import { findQualifyingSession } from "./verify-proof-internals.js";
 import { ESCALATION_FOLLOW_UP_CONTENT } from "./habit-checkin.js";
 import { onsetBeyondThreshold } from "./evaluate-stage-b.js";
@@ -99,14 +103,6 @@ interface Concept2Payload {
   readonly results: readonly Concept2Result[];
 }
 
-interface MorningRowProofConfig {
-  readonly min_minutes: number;
-}
-
-interface WindDownProofConfig {
-  readonly stage_b_threshold: string;
-}
-
 interface GarminSleepPayload {
   readonly sleep: {
     readonly sleep_onset_time: string | null;
@@ -159,34 +155,6 @@ function loadCachedConcept2Results(
   }
   const parsed = JSON.parse(row.payload_json) as Concept2Payload;
   return parsed.results;
-}
-
-function parseMorningRowConfig(
-  json: string,
-  habitId: string,
-): MorningRowProofConfig {
-  const parsed = JSON.parse(json) as Record<string, unknown>;
-  const minMinutes = parsed.min_minutes;
-  if (typeof minMinutes !== "number") {
-    throw new Error(
-      `habit ${habitId} proof_config_json missing numeric min_minutes`,
-    );
-  }
-  return { min_minutes: minMinutes };
-}
-
-function parseWindDownConfig(
-  json: string,
-  habitId: string,
-): WindDownProofConfig {
-  const parsed = JSON.parse(json) as Record<string, unknown>;
-  const threshold = parsed.stage_b_threshold;
-  if (typeof threshold !== "string") {
-    throw new Error(
-      `habit ${habitId} proof_config_json missing stage_b_threshold string`,
-    );
-  }
-  return { stage_b_threshold: threshold };
 }
 
 /**
