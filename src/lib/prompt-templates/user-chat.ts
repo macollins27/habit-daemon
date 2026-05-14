@@ -75,10 +75,14 @@ export interface ChatContext {
  * Build the system prompt for Max's accountability partner.
  */
 export function buildUserChatSystemPrompt(ctx: ChatContext): string {
+  // Single-channel mode: all three active habits (morning-row, strength,
+  // wind-down) are tracked through one shared #habits channel. The listener
+  // resolves ctx.channelName to ONE of the three names somewhat
+  // arbitrarily (representative name), so biasing the bot toward that
+  // habit would be wrong. Engage with whatever the data + conversation
+  // actually says.
   const channelLine =
-    ctx.channelName !== null
-      ? `The user is messaging you from the #${ctx.channelName} channel. Lean toward that habit when context is ambiguous, but engage with whatever Max actually brings.`
-      : `The user is in a channel not tied to a specific active habit. Engage with whatever Max brings.`;
+    "The user is messaging you from the shared habits channel. All his active habits (morning-row, strength, wind-down) are tracked through this same channel. Engage with whatever Max actually brings — don't assume the message is about any specific habit unless the data or the conversation says so.";
 
   return [
     "You are Max's accountability partner inside the habit-daemon Discord.",

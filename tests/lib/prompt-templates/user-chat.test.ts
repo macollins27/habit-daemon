@@ -29,17 +29,23 @@ function emptyCtx(overrides: Partial<ChatContext> = {}): ChatContext {
 }
 
 describe("buildUserChatSystemPrompt", () => {
-  it("embeds the channel name when one is provided", () => {
+  it("frames the shared habits channel (single-channel mode) regardless of which channelName was passed", () => {
+    // Single-channel mode: all three active habits share one channel, so the
+    // representative channelName the listener passes is somewhat arbitrary.
+    // The prompt must not bias the bot toward any specific habit based on it.
     const prompt = buildUserChatSystemPrompt(
       emptyCtx({ channelName: "morning-row" }),
     );
-    expect(prompt).toMatch(/#morning-row/);
-    expect(prompt).toMatch(/morning-row/);
+    expect(prompt).toMatch(/shared habits channel/i);
+    // Must NOT bias toward the passed channelName.
+    expect(prompt).not.toMatch(/Lean toward that habit/i);
+    // Should NOT render the channelName as a #-hash bias.
+    expect(prompt).not.toMatch(/#morning-row/);
   });
 
-  it("falls back to a general framing when channelName is null", () => {
+  it("uses the same shared-channel framing when channelName is null", () => {
     const prompt = buildUserChatSystemPrompt(emptyCtx({ channelName: null }));
-    expect(prompt).toMatch(/not tied to a specific active habit/);
+    expect(prompt).toMatch(/shared habits channel/i);
     // Should NOT contain a stray "null" channel mention.
     expect(prompt).not.toMatch(/#null/);
   });

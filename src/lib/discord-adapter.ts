@@ -323,6 +323,8 @@ export interface ActiveHabitRun {
   readonly current_level: number;
   readonly status: "pending" | "partial";
   readonly proof_rejection_callout_due: number;
+  readonly proof_type: string;
+  readonly proof_config_json: string;
 }
 
 export interface MessageMatch {
@@ -378,28 +380,117 @@ const ACTIVE_CHANNEL_NAMES: readonly ChannelName[] = [
   "wind-down",
 ];
 
+// Single-channel mode: multiple ChannelNames can share the same snowflake (the
+// user collapses #morning-row, #strength, #wind-down — and optionally #wins and
+// #sunday-review — into one #habits channel). The lookup must be many-to-many
+// or the last write wins and the listener silently loses one of the names.
 function buildActiveChannelLookup(
   channelIds: DiscordChannelIds,
-): ReadonlyMap<string, ChannelName> {
-  const map = new Map<string, ChannelName>();
+): ReadonlyMap<string, readonly ChannelName[]> {
+  const map = new Map<string, ChannelName[]>();
   for (const name of ACTIVE_CHANNEL_NAMES) {
-    map.set(channelIds[name], name);
+    const id = channelIds[name];
+    const existing = map.get(id);
+    if (existing) {
+      existing.push(name);
+    } else {
+      map.set(id, [name]);
+    }
   }
   return map;
 }
 
-// SQL for the single-row active-run lookup keyed by (channel_id, fire_date).
+// SQL for the multi-row active-run lookup keyed by (channel_id, fire_date).
 // Single source of truth for both the live listener (subscribeMessages) and
 // the bootstrap catch-up sweep (catchUpOnStartup) so the two paths cannot
 // drift in their matching semantics.
-const LOOKUP_ACTIVE_RUN_SQL =
-  `SELECT id, habit_id, fire_date, current_level, status,
-          proof_rejection_callout_due
-     FROM habit_runs
-    WHERE habit_id = (SELECT id FROM habits WHERE channel_id = ?)
-      AND fire_date = ?
-      AND status IN ('pending', 'partial')
-    LIMIT 1`;
+//
+// Single-channel mode: with multiple habits sharing a channel_id, we must
+// return ALL active runs and let the routing layer (message-shape pre-filter)
+// pick the candidate(s). The previous scalar-subquery pattern
+// (`habit_id = (SELECT id FROM habits WHERE channel_id = ?)`) was broken
+// once channel_id was no longer unique — SQLite picks one row
+// nondeterministically. A JOIN is correct here.
+//
+// proof_type + proof_config_json are pulled so the pre-filter can decide
+// which runs accept this message's shape (attachment vs trigger phrase).
+const LOOKUP_ACTIVE_RUNS_SQL =
+  `SELECT r.id, r.habit_id, r.fire_date, r.current_level, r.status,
+          r.proof_rejection_callout_due,
+          h.proof_type, h.proof_config_json
+     FROM habit_runs r
+     JOIN habits h ON h.id = r.habit_id
+    WHERE h.channel_id = ?
+      AND r.fire_date = ?
+      AND r.status IN ('pending', 'partial')
+    ORDER BY r.current_level DESC, r.fired_at ASC`;
+
+interface ProofConfigPhrase {
+  readonly stage_a_phrase?: string;
+}
+
+/**
+ * Message-shape pre-filter for single-channel mode routing.
+ *
+ * Given a list of all today's pending/partial runs that share the message's
+ * channel, return the subset whose `proof_type` accepts the message's shape:
+ *
+ *   - concept2_api+photo_fallback  → accepts messages WITH an attachment
+ *   - training_log_photo           → accepts messages WITH an attachment
+ *   - typed_msg+garmin_sleep       → accepts text messages containing the
+ *                                    configured `stage_a_phrase`
+ *
+ * Anything else (no attachment, no phrase match, unknown proof_type) returns
+ * `false` — those messages fall through to chat.
+ */
+function filterRunsByMessageShape(
+  runs: ReadonlyArray<ActiveHabitRun>,
+  hasAttachment: boolean,
+  text: string,
+): ReadonlyArray<ActiveHabitRun> {
+  const lowerText = text.toLowerCase();
+  return runs.filter((run) => {
+    const proofType = run.proof_type;
+    if (proofType === "concept2_api+photo_fallback") return hasAttachment;
+    if (proofType === "training_log_photo") return hasAttachment;
+    if (proofType === "typed_msg+garmin_sleep") {
+      try {
+        const cfg = JSON.parse(run.proof_config_json) as ProofConfigPhrase;
+        const phrase = (cfg.stage_a_phrase ?? "").toLowerCase();
+        return phrase.length > 0 && lowerText.includes(phrase);
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  });
+}
+
+/**
+ * Pick a representative ChannelName for a run when multiple names share a
+ * snowflake. We prefer the name that matches the run's habit_id mapping
+ * (morning-row run → "morning-row" channelName) so the proof handler's
+ * existing logging and post resolution still make sense even when the live
+ * channel is collapsed. Falls back to the first available name if no match.
+ */
+function pickChannelNameForRun(
+  names: readonly ChannelName[],
+  habitId: string,
+): ChannelName {
+  // habit_id → ChannelName map. The three Phase A habits seed their habit_id
+  // equal to their domain-ish slug; "strength-mwf" maps to "strength".
+  const habitToChannel: Record<string, ChannelName> = {
+    "morning-row": "morning-row",
+    "strength-mwf": "strength",
+    "wind-down": "wind-down",
+  };
+  const preferred = habitToChannel[habitId];
+  if (preferred !== undefined && names.includes(preferred)) {
+    return preferred;
+  }
+  // User-created habits / unknown habit_id — return the first available name.
+  return names[0] as ChannelName;
+}
 
 export function subscribeMessages(opts: SubscribeMessagesOptions): Unsubscribe {
   const { adapter, db, handler, chatHandler } = opts;
@@ -407,10 +498,12 @@ export function subscribeMessages(opts: SubscribeMessagesOptions): Unsubscribe {
 
   const activeChannels = buildActiveChannelLookup(adapter.channelIds);
 
-  // Single-row lookup. Joining channel_id → habit_id inline keeps the
+  // Multi-row lookup. Joining channel_id → habit_id inline keeps the
   // listener stateless: no in-memory cache of habit rows to keep coherent
-  // with schema changes (Phase B plan-change pipeline).
-  const lookupRun = db.prepare(LOOKUP_ACTIVE_RUN_SQL);
+  // with schema changes (Phase B plan-change pipeline). In single-channel
+  // mode this can return multiple rows; the pre-filter step below routes
+  // by message shape (attachment vs trigger phrase).
+  const lookupAllRuns = db.prepare(LOOKUP_ACTIVE_RUNS_SQL);
 
   const onMessage = (msg: Message): void => {
     // Diagnostic logging — every observed messageCreate is logged with the
@@ -454,64 +547,97 @@ export function subscribeMessages(opts: SubscribeMessagesOptions): Unsubscribe {
       return;
     }
 
-    const channelName = activeChannels.get(msg.channelId);
-    if (channelName === undefined) {
+    const channelNames = activeChannels.get(msg.channelId);
+    if (channelNames === undefined) {
       process.stdout.write(
         `[discord-listener] skip: channel ${msg.channelId} is not in the active list\n`,
       );
       return;
     }
+    // Representative ChannelName for diagnostic logging / chat-fall-through.
+    // When the snowflake maps to a single name this is just that name; when
+    // multiple names share the snowflake (single-channel mode) we pick the
+    // first for the chat-side dispatch (the chat orchestrator no longer
+    // biases on channelName — see prompt-templates/user-chat.ts).
+    const representativeChannelName = channelNames[0] as ChannelName;
 
     const today = localDateString(nowFn());
-    const row = lookupRun.get(adapter.channelIds[channelName], today) as
-      | ActiveHabitRun
-      | undefined;
-    if (row === undefined) {
-      // Phase 4: when an active-channel message has no matching proof run,
-      // fall through to the chat orchestrator if one is wired. Without a
-      // chatHandler the listener preserves prior behaviour (silent skip).
-      if (chatHandler !== undefined) {
+    const allRuns = lookupAllRuns.all(msg.channelId, today) as ActiveHabitRun[];
+
+    const hasAttachment = (msg.attachments?.size ?? 0) > 0;
+    const text = msg.content ?? "";
+    const candidates = filterRunsByMessageShape(allRuns, hasAttachment, text);
+
+    const dispatchChat = (logTag: string): void => {
+      if (chatHandler === undefined) {
         process.stdout.write(
-          `[discord-listener] chat-fallthrough: invoking chatHandler for channel=${channelName}\n`,
+          `[discord-listener] skip: ${logTag} (no chatHandler wired) channel=${representativeChannelName} fire_date=${today}\n`,
         );
-        let chatResult: Promise<void> | void;
-        try {
-          chatResult = chatHandler({
-            channelId: msg.channelId,
-            channelName,
-            text: msg.content ?? "",
-            message: msg,
-          });
-        } catch (err: unknown) {
-          console.error(
-            "[discord-listener] chatHandler threw synchronously",
-            err,
-          );
-          return;
-        }
-        if (
-          chatResult &&
-          typeof (chatResult as Promise<void>).catch === "function"
-        ) {
-          (chatResult as Promise<void>).catch((err: unknown) => {
-            console.error("[discord-listener] chatHandler rejected", err);
-          });
-        }
         return;
       }
       process.stdout.write(
-        `[discord-listener] skip: no active habit_run for channel=${channelName} fire_date=${today}\n`,
+        `[discord-listener] chat-fallthrough: ${logTag} channel=${representativeChannelName}\n`,
+      );
+      let chatResult: Promise<void> | void;
+      try {
+        chatResult = chatHandler({
+          channelId: msg.channelId,
+          channelName: representativeChannelName,
+          text,
+          message: msg,
+        });
+      } catch (err: unknown) {
+        console.error(
+          "[discord-listener] chatHandler threw synchronously",
+          err,
+        );
+        return;
+      }
+      if (
+        chatResult &&
+        typeof (chatResult as Promise<void>).catch === "function"
+      ) {
+        (chatResult as Promise<void>).catch((err: unknown) => {
+          console.error("[discord-listener] chatHandler rejected", err);
+        });
+      }
+    };
+
+    // Routing:
+    //   - 0 candidates: fall through to chat (or silent skip if no chatHandler).
+    //     "0 candidates" can mean (a) no active runs at all, or (b) active runs
+    //     exist but none accept this message's shape — both are conversational.
+    //   - 1 candidate: dispatch the proof handler with that single run.
+    //   - 2+ candidates: ambiguous — fall through to chat. The coach prompt
+    //     handles "which habit?" conversationally; no special routing state.
+    if (candidates.length === 0) {
+      dispatchChat(
+        allRuns.length === 0
+          ? "no active habit_run"
+          : `no proof-shape match (${allRuns.length} active run(s))`,
       );
       return;
     }
+
+    if (candidates.length >= 2) {
+      process.stdout.write(
+        `[discord-listener] ambiguous-proof: ${candidates.length} candidates match channel=${representativeChannelName} — falling through to chat handler for clarification\n`,
+      );
+      dispatchChat(`ambiguous-proof (${candidates.length} candidates)`);
+      return;
+    }
+
+    // candidates.length === 1
+    const row = candidates[0] as ActiveHabitRun;
+    const channelNameForRun = pickChannelNameForRun(channelNames, row.habit_id);
     process.stdout.write(
-      `[discord-listener] match: invoking handler for run=${row.id} channel=${channelName}\n`,
+      `[discord-listener] match: invoking handler for run=${row.id} channel=${channelNameForRun}\n`,
     );
 
     const match: MessageMatch = {
       run: row,
       message: msg,
-      channelName,
+      channelName: channelNameForRun,
     };
 
     let result: Promise<void> | void;
@@ -637,15 +763,44 @@ export async function catchUpOnStartup(
   const nowFn = opts.now ?? (() => new Date());
   const limit = opts.limit ?? 50;
 
-  const lookupRun = db.prepare(LOOKUP_ACTIVE_RUN_SQL);
+  const lookupAllRuns = db.prepare(LOOKUP_ACTIVE_RUNS_SQL);
   const readCursor = db.prepare(
     `SELECT last_seen_iso FROM discord_channel_cursors WHERE channel_id = ?`,
   );
 
   const results: CatchUpChannelResult[] = [];
+  const activeChannels = buildActiveChannelLookup(adapter.channelIds);
+
+  // Single-channel mode: multiple ChannelNames may share one snowflake. We
+  // iterate over UNIQUE snowflakes (not names) so each underlying Discord
+  // channel is fetched and replayed exactly once. We still emit one result
+  // entry per ACTIVE_CHANNEL_NAME for backwards compat with callers that
+  // log per-name — entries for names sharing a snowflake all reflect the
+  // same fetched/replayed/skipped counts.
+  const visitedChannelIds = new Set<string>();
+  const perChannelByName = new Map<ChannelName, CatchUpChannelResult>();
 
   for (const channelName of ACTIVE_CHANNEL_NAMES) {
     const channelId = adapter.channelIds[channelName];
+
+    if (visitedChannelIds.has(channelId)) {
+      // Already processed via another name that shares this snowflake.
+      // Mirror the counts from the first visit so logs stay symmetric.
+      const sharedNames = activeChannels.get(channelId) ?? [];
+      const firstName = sharedNames[0];
+      const prev =
+        firstName !== undefined ? perChannelByName.get(firstName) : undefined;
+      const entry: CatchUpChannelResult = {
+        channelName,
+        fetched: prev?.fetched ?? 0,
+        replayed: prev?.replayed ?? 0,
+        skipped: prev?.skipped ?? 0,
+      };
+      perChannelByName.set(channelName, entry);
+      results.push(entry);
+      continue;
+    }
+    visitedChannelIds.add(channelId);
 
     // Read cursor. Missing row → cursorMs === null → replay everything we
     // fetch (up to `limit`). NaN guard: a malformed last_seen_iso shouldn't
@@ -667,12 +822,26 @@ export async function catchUpOnStartup(
         `[catch-up] fetch channel ${channelName} (${channelId}) failed:`,
         err,
       );
-      results.push({ channelName, fetched: 0, replayed: 0, skipped: 0 });
+      const entry: CatchUpChannelResult = {
+        channelName,
+        fetched: 0,
+        replayed: 0,
+        skipped: 0,
+      };
+      perChannelByName.set(channelName, entry);
+      results.push(entry);
       continue;
     }
 
     if (!isFetchableMessagesChannel(channel) || !channel.isTextBased()) {
-      results.push({ channelName, fetched: 0, replayed: 0, skipped: 0 });
+      const entry: CatchUpChannelResult = {
+        channelName,
+        fetched: 0,
+        replayed: 0,
+        skipped: 0,
+      };
+      perChannelByName.set(channelName, entry);
+      results.push(entry);
       continue;
     }
 
@@ -691,11 +860,22 @@ export async function catchUpOnStartup(
         `[catch-up] fetch messages for ${channelName} failed:`,
         err,
       );
-      results.push({ channelName, fetched: 0, replayed: 0, skipped: 0 });
+      const entry: CatchUpChannelResult = {
+        channelName,
+        fetched: 0,
+        replayed: 0,
+        skipped: 0,
+      };
+      perChannelByName.set(channelName, entry);
+      results.push(entry);
       continue;
     }
 
     const fetched = messages.length;
+    const sharedNames = activeChannels.get(channelId) ?? [channelName];
+    // Representative name for chat-fallthrough dispatch when this snowflake
+    // maps to multiple ChannelNames (single-channel mode).
+    const representativeChannelName = sharedNames[0] as ChannelName;
 
     // Newer-than-cursor + non-bot, in chronological order (oldest first).
     const fresh = messages
@@ -723,50 +903,74 @@ export async function catchUpOnStartup(
         msg.createdAt instanceof Date ? msg.createdAt : nowFn(),
       );
 
-      // Match to today's pending/partial run using the same SQL as the
-      // live listener. "Today" here is the daemon's local date at the
-      // moment of the sweep; if a message arrived yesterday during the
-      // restart, the handler will see a yesterday-dated run only if that
-      // run is still pending/partial — same semantics as live.
+      // Match to today's pending/partial runs using the same SQL as the live
+      // listener, then route by message-shape pre-filter. "Today" here is the
+      // daemon's local date at the moment of the sweep.
       const today = localDateString(nowFn());
-      const row = lookupRun.get(adapter.channelIds[channelName], today) as
-        | ActiveHabitRun
-        | undefined;
-      if (row === undefined) {
-        // Phase 4: fall through to chat replay if wired. Mirrors the live
-        // listener invariant — chat is the alternative to a silent skip.
-        if (chatHandler !== undefined) {
-          try {
-            const chatResult = chatHandler({
-              channelId: msg.channelId,
-              channelName,
-              text: msg.content ?? "",
-              message: msg,
-            });
-            if (
-              chatResult &&
-              typeof (chatResult as Promise<void>).then === "function"
-            ) {
-              await (chatResult as Promise<void>);
-            }
-            replayed += 1;
-          } catch (err: unknown) {
-            console.error(
-              `[catch-up] chatHandler threw while replaying message ${msg.id} on ${channelName}:`,
-              err,
-            );
-            skipped += 1;
+      const allRuns = lookupAllRuns.all(msg.channelId, today) as ActiveHabitRun[];
+      const hasAttachment = (msg.attachments?.size ?? 0) > 0;
+      const text = msg.content ?? "";
+      const candidates = filterRunsByMessageShape(allRuns, hasAttachment, text);
+
+      // Helper: dispatch chat fall-through if wired; otherwise count skipped.
+      const dispatchChat = async (logTag: string): Promise<boolean> => {
+        if (chatHandler === undefined) return false;
+        try {
+          const chatResult = chatHandler({
+            channelId: msg.channelId,
+            channelName: representativeChannelName,
+            text,
+            message: msg,
+          });
+          if (
+            chatResult &&
+            typeof (chatResult as Promise<void>).then === "function"
+          ) {
+            await (chatResult as Promise<void>);
           }
-          continue;
+          return true;
+        } catch (err: unknown) {
+          console.error(
+            `[catch-up] chatHandler threw while replaying message ${msg.id} (${logTag}) on ${representativeChannelName}:`,
+            err,
+          );
+          return false;
         }
-        skipped += 1;
+      };
+
+      if (candidates.length === 0) {
+        const ok = await dispatchChat(
+          allRuns.length === 0
+            ? "no active habit_run"
+            : `no proof-shape match (${allRuns.length} active run(s))`,
+        );
+        if (ok) replayed += 1;
+        else skipped += 1;
         continue;
       }
 
+      if (candidates.length >= 2) {
+        process.stdout.write(
+          `[catch-up] ambiguous-proof: ${candidates.length} candidates match channel=${representativeChannelName} — falling through to chat handler for clarification\n`,
+        );
+        const ok = await dispatchChat(
+          `ambiguous-proof (${candidates.length} candidates)`,
+        );
+        if (ok) replayed += 1;
+        else skipped += 1;
+        continue;
+      }
+
+      // candidates.length === 1
+      const row = candidates[0] as ActiveHabitRun;
+      const channelNameForRun = pickChannelNameForRun(
+        sharedNames,
+        row.habit_id,
+      );
       const match: MessageMatch = {
         run: row,
         message: msg,
-        channelName,
+        channelName: channelNameForRun,
       };
 
       try {
@@ -777,7 +981,7 @@ export async function catchUpOnStartup(
         replayed += 1;
       } catch (err: unknown) {
         console.error(
-          `[catch-up] handler threw while replaying message ${msg.id} on ${channelName}:`,
+          `[catch-up] handler threw while replaying message ${msg.id} on ${channelNameForRun}:`,
           err,
         );
         // Count as skipped — the message was observed and the cursor advanced,
@@ -786,7 +990,14 @@ export async function catchUpOnStartup(
       }
     }
 
-    results.push({ channelName, fetched, replayed, skipped });
+    const entry: CatchUpChannelResult = {
+      channelName,
+      fetched,
+      replayed,
+      skipped,
+    };
+    perChannelByName.set(channelName, entry);
+    results.push(entry);
   }
 
   return { perChannel: results };

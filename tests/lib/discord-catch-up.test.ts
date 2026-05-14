@@ -54,15 +54,19 @@ interface FakeMessageOptions {
   readonly bot?: boolean;
   readonly id?: string;
   readonly content?: string;
+  /** Sets attachments.size = 1 (or 0) so the pre-filter sees a photo. */
+  readonly hasAttachment?: boolean;
 }
 
 function makeMessage(opts: FakeMessageOptions): Message {
+  const size = opts.hasAttachment ? 1 : 0;
   return {
     id: opts.id ?? "m-" + randomUUID(),
     channelId: opts.channelId,
     content: opts.content ?? "",
     author: { bot: opts.bot ?? false },
     createdAt: opts.createdAt,
+    attachments: { size },
   } as unknown as Message;
 }
 
@@ -184,10 +188,12 @@ describe("catchUpOnStartup()", () => {
     const at1030 = new Date("2026-05-13T10:30:00Z");
     const at1100 = new Date("2026-05-13T11:00:00Z");
 
+    // Pre-filter requires an attachment for morning-row's
+    // `concept2_api+photo_fallback` proof_type.
     const messages = [
-      makeMessage({ channelId: CH_MORNING_ROW, createdAt: at1100, id: "m-1100" }),
-      makeMessage({ channelId: CH_MORNING_ROW, createdAt: at0900, id: "m-0900" }),
-      makeMessage({ channelId: CH_MORNING_ROW, createdAt: at1030, id: "m-1030" }),
+      makeMessage({ channelId: CH_MORNING_ROW, createdAt: at1100, id: "m-1100", hasAttachment: true }),
+      makeMessage({ channelId: CH_MORNING_ROW, createdAt: at0900, id: "m-0900", hasAttachment: true }),
+      makeMessage({ channelId: CH_MORNING_ROW, createdAt: at1030, id: "m-1030", hasAttachment: true }),
     ];
 
     h = await buildHarness([
@@ -233,10 +239,11 @@ describe("catchUpOnStartup()", () => {
     const at0900 = new Date("2026-05-13T09:00:00Z");
     const at1000 = new Date("2026-05-13T10:00:00Z");
 
+    // Pre-filter requires an attachment for morning-row's proof_type.
     const messages = [
-      makeMessage({ channelId: CH_MORNING_ROW, createdAt: at0800, id: "m-a" }),
-      makeMessage({ channelId: CH_MORNING_ROW, createdAt: at0900, id: "m-b" }),
-      makeMessage({ channelId: CH_MORNING_ROW, createdAt: at1000, id: "m-c" }),
+      makeMessage({ channelId: CH_MORNING_ROW, createdAt: at0800, id: "m-a", hasAttachment: true }),
+      makeMessage({ channelId: CH_MORNING_ROW, createdAt: at0900, id: "m-b", hasAttachment: true }),
+      makeMessage({ channelId: CH_MORNING_ROW, createdAt: at1000, id: "m-c", hasAttachment: true }),
     ];
 
     h = await buildHarness(
@@ -276,12 +283,14 @@ describe("catchUpOnStartup()", () => {
         createdAt: at1000,
         id: "m-user",
         bot: false,
+        hasAttachment: true,
       }),
       makeMessage({
         channelId: CH_MORNING_ROW,
         createdAt: at1100,
         id: "m-bot",
         bot: true,
+        hasAttachment: true,
       }),
     ];
 

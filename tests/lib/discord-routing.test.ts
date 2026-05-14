@@ -78,14 +78,18 @@ interface FakeMessageOptions {
   readonly channelId: string;
   readonly bot?: boolean;
   readonly content?: string;
+  /** Sets attachments.size = 1 (or 0) so the pre-filter sees a photo. */
+  readonly hasAttachment?: boolean;
 }
 
 function makeMessage(opts: FakeMessageOptions): Message {
+  const size = opts.hasAttachment ? 1 : 0;
   return {
     id: "m-" + randomUUID(),
     channelId: opts.channelId,
     content: opts.content ?? "hello bot",
     author: { bot: opts.bot ?? false },
+    attachments: { size },
   } as unknown as Message;
 }
 
@@ -201,7 +205,15 @@ describe("subscribeMessages chat fall-through", () => {
       now: () => h.now,
     });
 
-    h.mockClient.emit(makeMessage({ channelId: CH_MORNING_ROW, content: "done!" }));
+    // Pre-filter requires an attachment for the `concept2_api+photo_fallback`
+    // proof_type. A pure-text message would (correctly) fall through to chat.
+    h.mockClient.emit(
+      makeMessage({
+        channelId: CH_MORNING_ROW,
+        content: "done!",
+        hasAttachment: true,
+      }),
+    );
 
     expect(proofHandler).toHaveBeenCalledTimes(1);
     expect(chatHandler).not.toHaveBeenCalled();
@@ -277,5 +289,191 @@ describe("subscribeMessages chat fall-through", () => {
     expect(chatHandler).toHaveBeenCalledTimes(2);
     expect(errorSpy).toHaveBeenCalled();
     errorSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Single-channel mode: multiple habits share one Discord channel snowflake.
+// The listener must:
+//   - look up ALL active runs for that channel (multi-row, not LIMIT 1),
+//   - pre-filter by message shape (attachment vs trigger phrase),
+//   - route to proof on exactly 1 candidate, otherwise fall through to chat.
+//
+// To exercise this, we re-seed `habits.channel_id` to a shared snowflake for
+// all three active habits after the standard seed runs.
+// ---------------------------------------------------------------------------
+
+const CH_SHARED = "1000000000000000099";
+
+function seedRunWithLevel(
+  db: Database.Database,
+  habitId: string,
+  fireDate: string,
+  status: "pending" | "partial",
+  currentLevel: number,
+): string {
+  const id = "run-" + randomUUID();
+  db.prepare(
+    `INSERT INTO habit_runs (
+       id, habit_id, fire_date, fired_at, current_level, next_escalation_at,
+       status, completed_at, proof_payload_json, skip_reason,
+       proof_rejection_callout_due
+     ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, NULL, NULL, 0)`,
+  ).run(id, habitId, fireDate, Date.now(), currentLevel, status);
+  return id;
+}
+
+async function buildSingleChannelHarness(
+  now: Date = new Date("2026-05-13T10:30:00"),
+): Promise<Harness> {
+  const db = openDatabase(":memory:");
+  await runMigrations(db, loadMigrations());
+  // Seed all three habits with the SAME channel_id — simulating the user's
+  // ~/.habit-daemon/env update where DISCORD_CHANNEL_* all point at one
+  // #habits channel and habits.channel_id is UPDATEd to match.
+  seedHabits(db, {
+    morningRow: CH_SHARED,
+    strength: CH_SHARED,
+    windDown: CH_SHARED,
+  });
+  const mockClient = makeMockClient();
+  const adapter = createDiscordAdapter({
+    botToken: "test-bot-token",
+    channelIds: {
+      "morning-row": CH_SHARED,
+      strength: CH_SHARED,
+      "wind-down": CH_SHARED,
+      wins: CH_SHARED,
+      "sunday-review": CH_SHARED,
+    },
+    clientFactory: () => mockClient as unknown as Client,
+  });
+  return { db, adapter, mockClient, now };
+}
+
+describe("subscribeMessages single-channel mode", () => {
+  let h: Harness;
+
+  afterEach(() => {
+    h?.db.close();
+  });
+
+  it("multi-run lookup with shared channel: plain text falls through to chat (not proof)", async () => {
+    h = await buildSingleChannelHarness();
+    const today = localDateString(h.now);
+    // Two active runs (morning-row + strength) on the SHARED channel today.
+    seedRunWithLevel(h.db, "morning-row", today, "pending", 1);
+    seedRunWithLevel(h.db, "strength-mwf", today, "pending", 1);
+
+    const proofHandler = vi.fn();
+    const chatHandler = vi.fn();
+
+    subscribeMessages({
+      adapter: h.adapter,
+      db: h.db,
+      handler: proofHandler,
+      chatHandler,
+      now: () => h.now,
+    });
+
+    // Plain text, no attachment, no trigger phrase. Neither run's proof_type
+    // accepts this shape → candidates = []. Listener must fall through to
+    // chat instead of nondeterministically picking one run for proof.
+    h.mockClient.emit(
+      makeMessage({ channelId: CH_SHARED, content: "hey how's it going" }),
+    );
+
+    expect(proofHandler).not.toHaveBeenCalled();
+    expect(chatHandler).toHaveBeenCalledTimes(1);
+    const args = chatHandler.mock.calls[0]![0] as ChatFallthroughArgs;
+    expect(args.channelId).toBe(CH_SHARED);
+    expect(args.text).toBe("hey how's it going");
+  });
+
+  it("ambiguous-proof: attachment with two photo-accepting runs falls through to chat", async () => {
+    h = await buildSingleChannelHarness();
+    const today = localDateString(h.now);
+    // Both morning-row (concept2_api+photo_fallback) and strength-mwf
+    // (training_log_photo) accept an attachment. With both pending on the
+    // shared channel, the listener must NOT guess — it falls through to chat.
+    seedRunWithLevel(h.db, "morning-row", today, "pending", 1);
+    seedRunWithLevel(h.db, "strength-mwf", today, "pending", 1);
+
+    const proofHandler = vi.fn();
+    const chatHandler = vi.fn();
+
+    const stdoutSpy = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation(() => true);
+
+    subscribeMessages({
+      adapter: h.adapter,
+      db: h.db,
+      handler: proofHandler,
+      chatHandler,
+      now: () => h.now,
+    });
+
+    h.mockClient.emit(
+      makeMessage({
+        channelId: CH_SHARED,
+        content: "here you go",
+        hasAttachment: true,
+      }),
+    );
+
+    expect(proofHandler).not.toHaveBeenCalled();
+    expect(chatHandler).toHaveBeenCalledTimes(1);
+
+    // Verify the ambiguous-proof log fires so operators can see why a photo
+    // routed to chat (the coach asks "which habit?" conversationally).
+    const ambiguousLog = stdoutSpy.mock.calls.some((c) =>
+      String(c[0] ?? "").includes("ambiguous-proof: 2 candidates"),
+    );
+    expect(ambiguousLog).toBe(true);
+    stdoutSpy.mockRestore();
+  });
+
+  it("filter to single candidate: attachment with one photo run + one phrase-only run routes to proof", async () => {
+    h = await buildSingleChannelHarness();
+    const today = localDateString(h.now);
+    // morning-row accepts photos; wind-down accepts only the typed trigger
+    // phrase. An attachment with no phrase narrows to a single candidate
+    // (morning-row) and the proof handler MUST fire with that run.
+    const morningRowRunId = seedRunWithLevel(
+      h.db,
+      "morning-row",
+      today,
+      "pending",
+      1,
+    );
+    seedRunWithLevel(h.db, "wind-down", today, "pending", 1);
+
+    const proofHandler = vi.fn();
+    const chatHandler = vi.fn();
+
+    subscribeMessages({
+      adapter: h.adapter,
+      db: h.db,
+      handler: proofHandler,
+      chatHandler,
+      now: () => h.now,
+    });
+
+    h.mockClient.emit(
+      makeMessage({
+        channelId: CH_SHARED,
+        content: "rowed",
+        hasAttachment: true,
+      }),
+    );
+
+    expect(chatHandler).not.toHaveBeenCalled();
+    expect(proofHandler).toHaveBeenCalledTimes(1);
+    const match = proofHandler.mock.calls[0]![0] as MessageMatch;
+    expect(match.run.id).toBe(morningRowRunId);
+    expect(match.run.habit_id).toBe("morning-row");
+    // The representative channelName should be the one matching the run.
+    expect(match.channelName).toBe("morning-row");
   });
 });
