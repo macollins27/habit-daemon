@@ -107,10 +107,12 @@ interface GarminSleepPayload {
 /**
  * Loads runs that the reconciler may close out.
  *
- * Includes both `status='pending'` (Concept2 morning-row + wind-down
- * not-yet-typed) AND `status='partial'` (wind-down typed-msg-confirmed,
- * awaiting Garmin onset). Each per-proof-type branch is responsible for
- * filtering rows it does not own. See ADR Task 1.3.
+ * Includes `status='pending'` (Concept2 morning-row + wind-down
+ * not-yet-typed), `status='partial'` (wind-down typed-msg-confirmed,
+ * awaiting Garmin onset), AND `status='missed'` (L5 already gave up but
+ * sensor data may still arrive — retroactive completion path). Each
+ * per-proof-type branch is responsible for filtering rows it does not
+ * own. See ADR Task 1.3 + retroactive un-miss followup.
  */
 function loadPendingRuns(
   db: Database.Database,
@@ -128,7 +130,7 @@ function loadPendingRuns(
               r.last_escalation_message_id AS last_escalation_message_id
          FROM habit_runs r
          JOIN habits h ON h.id = r.habit_id
-        WHERE r.status IN ('pending','partial')
+        WHERE r.status IN ('pending','partial','missed')
           AND r.fire_date = ?`,
     )
     .all(today) as readonly PendingRunRow[];
@@ -192,21 +194,40 @@ function loadGarminOnsetHHMM(
   return extractHHMM(payload.sleep.sleep_onset_time);
 }
 
-export function formatWindDownSummary(onset: string, threshold: string): string {
-  return `✓ Wind-down · asleep ${onset} (threshold ${threshold})`;
+/**
+ * When `retroactive=true`, append a `_(retroactive)_` marker so the
+ * #wins / source-channel post visibly indicates this completion came in
+ * after L5 already marked the run missed. The marker uses Discord
+ * italic markdown so it renders as a softer secondary line.
+ */
+export function formatWindDownSummary(
+  onset: string,
+  threshold: string,
+  retroactive?: boolean,
+): string {
+  const base = `✓ Wind-down · asleep ${onset} (threshold ${threshold})`;
+  return retroactive === true ? `${base} _(retroactive)_` : base;
 }
 
 /**
  * Compose a `✓` ack line for #wins + source channel.
  *
  * Example: `✓ Morning row · 2026-05-13 09:35:00 · 10:03 · 2279m`.
+ *
+ * When `retroactive=true`, append a `_(retroactive)_` marker so the
+ * #wins / source-channel post visibly indicates this completion came in
+ * after L5 already marked the run missed.
  */
-export function formatMorningRowSummary(session: Concept2Result): string {
+export function formatMorningRowSummary(
+  session: Concept2Result,
+  retroactive?: boolean,
+): string {
   const totalSeconds = Math.floor(session.duration_seconds);
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   const mmss = `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
-  return `✓ Morning row · ${session.date} · ${mmss} · ${session.distance_meters}m`;
+  const base = `✓ Morning row · ${session.date} · ${mmss} · ${session.distance_meters}m`;
+  return retroactive === true ? `${base} _(retroactive)_` : base;
 }
 
 interface CompletionWriteContext {
@@ -274,19 +295,27 @@ export async function reconcilePendingRuns(
     // reconciler took ownership of, so the cron operator's view of
     // "work attempted vs. closed" is honest.
     if (row.proof_type === "concept2_api+photo_fallback") {
-      // Concept2 runs only exist in `status='pending'` (no partial
-      // state for morning-row); skip partial rows defensively.
-      if (row.status !== "pending") continue;
+      // Concept2 runs exist in `status='pending'` (active) and
+      // `status='missed'` (L5 already gave up — retroactive path).
+      // There is no `partial` state for morning-row.
+      if (row.status !== "pending" && row.status !== "missed") continue;
 
       attempted += 1;
       const didComplete = await reconcileConcept2Row(opts, row, today);
       if (didComplete) completed += 1;
     } else if (row.proof_type === "typed_msg+garmin_sleep") {
-      // Wind-down accepts both `pending` (user has not typed
-      // "shutting down") AND `partial` (typed-msg confirmed, awaiting
-      // Garmin onset). Either way, an at-or-before-threshold Garmin
-      // onset closes the run.
-      if (row.status !== "pending" && row.status !== "partial") continue;
+      // Wind-down accepts `pending` (user has not typed
+      // "shutting down"), `partial` (typed-msg confirmed, awaiting
+      // Garmin onset), AND `missed` (L5 already gave up, sensor
+      // arriving late triggers retroactive un-miss). Either way, an
+      // at-or-before-threshold Garmin onset closes the run.
+      if (
+        row.status !== "pending" &&
+        row.status !== "partial" &&
+        row.status !== "missed"
+      ) {
+        continue;
+      }
 
       attempted += 1;
       const didComplete = await reconcileWindDownRow(opts, row, today);
@@ -329,10 +358,16 @@ async function reconcileConcept2Row(
 
   if (matched === undefined) return false;
 
+  // Retroactive un-miss: when the source row was already marked missed
+  // (L5 gave up), flag the proof + summary so downstream consumers can
+  // tell this completion arrived after the deadline.
+  const isRetroactive = row.status === "missed";
+
   const proofPayload = {
     source: "concept2" as const,
     session: matched,
     autoDetected: true,
+    ...(isRetroactive ? { retroactive: true } : {}),
   };
 
   writeCompletion({
@@ -344,7 +379,7 @@ async function reconcileConcept2Row(
     proofPayload,
   });
 
-  const summary = formatMorningRowSummary(matched);
+  const summary = formatMorningRowSummary(matched, isRetroactive);
   await postDualChannel(opts, row, summary);
   return true;
 }
@@ -371,10 +406,16 @@ async function reconcileWindDownRow(
     return false;
   }
 
+  // Retroactive un-miss: when the source row was already marked missed
+  // (L5 gave up), flag the proof + summary so downstream consumers can
+  // tell this completion arrived after the deadline.
+  const isRetroactive = row.status === "missed";
+
   const proofPayload = {
     source: "garmin" as const,
     sleep_onset: onset,
     autoDetected: true,
+    ...(isRetroactive ? { retroactive: true } : {}),
   };
 
   writeCompletion({
@@ -386,7 +427,11 @@ async function reconcileWindDownRow(
     proofPayload,
   });
 
-  const summary = formatWindDownSummary(onset, config.stage_b_threshold);
+  const summary = formatWindDownSummary(
+    onset,
+    config.stage_b_threshold,
+    isRetroactive,
+  );
   await postDualChannel(opts, row, summary);
   return true;
 }

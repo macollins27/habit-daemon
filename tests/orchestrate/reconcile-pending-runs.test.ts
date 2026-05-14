@@ -620,6 +620,255 @@ describe("reconcilePendingRuns()", () => {
     }
   });
 
+  // ---------------------------------------------------------------------
+  // Retroactive un-miss: when L5 has already marked the run missed but
+  // qualifying sensor data arrives later (e.g. Concept2 sync was lagging),
+  // the reconciler should flip it back to completed and post a (retroactive)
+  // ack so the operator sees the closure.
+  //
+  // applyMissed in evaluate-stage-b sets next_escalation_at = NULL when
+  // transitioning to missed, so the reconciler should preserve NULL on
+  // the UPDATE. The proof_payload must include retroactive=true, and
+  // the dual-channel post summary must include the `(retroactive)`
+  // marker so it's visually distinct from a normal #wins post.
+  // ---------------------------------------------------------------------
+  it("retroactively completes a missed morning-row run when Concept2 has a qualifying session", async () => {
+    const db = sessionStore.db;
+    const runId = "test-run-missed-row";
+    const fireDate = "2026-05-13";
+    const nowMs = Date.parse("2026-05-13T15:00:00Z");
+
+    // Seed: status='missed', current_level=5, next_escalation_at=NULL.
+    // Mirrors what applyMissed in evaluate-stage-b would have written.
+    db.prepare(
+      `INSERT INTO habit_runs (
+         id, habit_id, fire_date, fired_at, current_level, next_escalation_at,
+         status, completed_at, proof_payload_json, skip_reason,
+         proof_rejection_callout_due
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      runId,
+      "morning-row",
+      fireDate,
+      Date.parse("2026-05-13T09:05:00Z"),
+      5,
+      null,
+      "missed",
+      null,
+      null,
+      null,
+      0,
+    );
+
+    const qualifyingSession = {
+      id: 999,
+      date: "2026-05-13 09:35:00",
+      type: "rower",
+      duration_seconds: 603.3,
+      distance_meters: 2279,
+    };
+    db.prepare(
+      `INSERT INTO sensor_signals (id, source, payload_date, payload_json, fetched_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run(
+      "concept2-2026-05-13",
+      "concept2",
+      fireDate,
+      JSON.stringify({ results: [qualifyingSession] }),
+      nowMs,
+    );
+
+    const posts: Array<{ channelId: string; summary: string }> = [];
+
+    const result = await reconcilePendingRuns({
+      sessionStore,
+      now: nowMs,
+      concept2Sync: async () => {},
+      garminSync: async () => {},
+      postCompletion: async (o) =>
+        void posts.push({ channelId: o.channelId, summary: o.summary }),
+    });
+
+    expect(result.attempted).toBe(1);
+    expect(result.completed).toBe(1);
+    expect(result.stillPending).toBe(0);
+
+    const updated = db
+      .prepare(
+        "SELECT status, completed_at, next_escalation_at, proof_payload_json FROM habit_runs WHERE id = ?",
+      )
+      .get(runId) as {
+      status: string;
+      completed_at: number | null;
+      next_escalation_at: number | null;
+      proof_payload_json: string;
+    };
+    expect(updated.status).toBe("completed");
+    expect(updated.completed_at).toBe(nowMs);
+    // Preserve NULL on un-miss — do not resurrect the escalation timer.
+    expect(updated.next_escalation_at).toBeNull();
+    // Proof payload must flag the retroactive un-miss path.
+    expect(updated.proof_payload_json).not.toBeNull();
+    expect(updated.proof_payload_json).toContain('"retroactive":true');
+    expect(updated.proof_payload_json).toContain('"autoDetected":true');
+
+    // Dual-channel post: source channel + #wins, both with (retroactive).
+    expect(posts).toHaveLength(2);
+    const channelIds = posts.map((p) => p.channelId).sort();
+    expect(channelIds).toEqual([SEED_CHANNELS.morningRow, "wins"].sort());
+    for (const p of posts) {
+      expect(p.summary).toContain("(retroactive)");
+    }
+  });
+
+  it("retroactively completes a missed wind-down run when Garmin onset is before threshold", async () => {
+    // The reconciler filters by `fire_date = today (local)`. Use the
+    // same local date for both so the missed row is in scope.
+    const db = sessionStore.db;
+    const runId = "test-run-missed-windown";
+    const fireDate = "2026-05-13";
+    const nowMs = Date.parse("2026-05-13T15:00:00Z");
+
+    // status='missed', current_level=5, next_escalation_at=NULL —
+    // simulates the L5-gave-up state that applyMissed writes.
+    db.prepare(
+      `INSERT INTO habit_runs (
+         id, habit_id, fire_date, fired_at, current_level, next_escalation_at,
+         status, completed_at, proof_payload_json, skip_reason,
+         proof_rejection_callout_due
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      runId,
+      "wind-down",
+      fireDate,
+      Date.parse("2026-05-13T22:00:00Z"),
+      5,
+      null,
+      "missed",
+      null,
+      null,
+      null,
+      0,
+    );
+
+    // Onset 22:30 ≤ threshold 23:00 → retroactive completion.
+    db.prepare(
+      `INSERT INTO sensor_signals (id, source, payload_date, payload_json, fetched_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run(
+      "garmin-2026-05-13",
+      "garmin",
+      fireDate,
+      JSON.stringify({
+        sleep: { sleep_onset_time: "2026-05-13T22:30:00" },
+      }),
+      nowMs,
+    );
+
+    const posts: Array<{ channelId: string; summary: string }> = [];
+
+    const result = await reconcilePendingRuns({
+      sessionStore,
+      now: nowMs,
+      concept2Sync: async () => {},
+      garminSync: async () => {},
+      postCompletion: async (o) =>
+        void posts.push({ channelId: o.channelId, summary: o.summary }),
+    });
+
+    expect(result.attempted).toBe(1);
+    expect(result.completed).toBe(1);
+    expect(result.stillPending).toBe(0);
+
+    const updated = db
+      .prepare(
+        "SELECT status, completed_at, next_escalation_at, proof_payload_json FROM habit_runs WHERE id = ?",
+      )
+      .get(runId) as {
+      status: string;
+      completed_at: number | null;
+      next_escalation_at: number | null;
+      proof_payload_json: string;
+    };
+    expect(updated.status).toBe("completed");
+    expect(updated.completed_at).toBe(nowMs);
+    expect(updated.next_escalation_at).toBeNull();
+    expect(updated.proof_payload_json).not.toBeNull();
+    expect(updated.proof_payload_json).toContain('"retroactive":true');
+    expect(updated.proof_payload_json).toContain('"autoDetected":true');
+
+    expect(posts).toHaveLength(2);
+    const channelIds = posts.map((p) => p.channelId).sort();
+    expect(channelIds).toEqual([SEED_CHANNELS.windDown, "wins"].sort());
+    for (const p of posts) {
+      expect(p.summary).toContain("22:30");
+      expect(p.summary).toContain("(retroactive)");
+    }
+  });
+
+  it("leaves a missed run untouched when sensor data does not qualify", async () => {
+    // Negative: a missed run with no qualifying sensor data stays missed.
+    // The counter semantics: attempted=1 (we tried), completed=0,
+    // stillPending=1 (the natural "tried but couldn't close" bucket).
+    const db = sessionStore.db;
+    const runId = "test-run-missed-no-sensor";
+    const fireDate = "2026-05-13";
+    const nowMs = Date.parse("2026-05-13T15:00:00Z");
+
+    db.prepare(
+      `INSERT INTO habit_runs (
+         id, habit_id, fire_date, fired_at, current_level, next_escalation_at,
+         status, completed_at, proof_payload_json, skip_reason,
+         proof_rejection_callout_due
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      runId,
+      "morning-row",
+      fireDate,
+      Date.parse("2026-05-13T09:05:00Z"),
+      5,
+      null,
+      "missed",
+      null,
+      null,
+      null,
+      0,
+    );
+
+    // NOTE: no sensor_signals row → findQualifyingSession returns undefined.
+
+    const posts: Array<{ channelId: string; summary: string }> = [];
+
+    const result = await reconcilePendingRuns({
+      sessionStore,
+      now: nowMs,
+      concept2Sync: async () => {},
+      garminSync: async () => {},
+      postCompletion: async (o) =>
+        void posts.push({ channelId: o.channelId, summary: o.summary }),
+    });
+
+    expect(result.attempted).toBe(1);
+    expect(result.completed).toBe(0);
+    expect(result.stillPending).toBe(1);
+
+    const updated = db
+      .prepare(
+        "SELECT status, completed_at, next_escalation_at, proof_payload_json FROM habit_runs WHERE id = ?",
+      )
+      .get(runId) as {
+      status: string;
+      completed_at: number | null;
+      next_escalation_at: number | null;
+      proof_payload_json: string | null;
+    };
+    expect(updated.status).toBe("missed");
+    expect(updated.completed_at).toBeNull();
+    expect(updated.next_escalation_at).toBeNull();
+    expect(updated.proof_payload_json).toBeNull();
+    expect(posts).toHaveLength(0);
+  });
+
   it("leaves a pending wind-down run untouched when no Garmin row exists", async () => {
     const db = sessionStore.db;
     const runId = "test-run-windown-nodata";
