@@ -4,7 +4,7 @@
 // the rest of Phase 4 relies on:
 //   - channelName presence is reflected in the prompt
 //   - the JSON context block round-trips the input
-//   - the no-action / read-only instruction is present
+//   - the prompt frames the bot as Max's accountability partner (not a Q&A bot)
 //   - `channelName: null` is handled gracefully (no string concat with null)
 
 import { describe, it, expect } from "vitest";
@@ -34,7 +34,7 @@ describe("buildUserChatSystemPrompt", () => {
       emptyCtx({ channelName: "morning-row" }),
     );
     expect(prompt).toMatch(/#morning-row/);
-    expect(prompt).toMatch(/Bias your answer toward the morning-row habit/);
+    expect(prompt).toMatch(/morning-row/);
   });
 
   it("falls back to a general framing when channelName is null", () => {
@@ -73,16 +73,32 @@ describe("buildUserChatSystemPrompt", () => {
     expect(prompt).toContain('"current_level": 2');
   });
 
-  it("includes the read-only / no-action instruction so the model declines edits", () => {
+  it("frames the bot as Max's accountability partner, not a Q&A assistant", () => {
     const prompt = buildUserChatSystemPrompt(emptyCtx());
-    expect(prompt).toMatch(/read-only/i);
-    expect(prompt).toMatch(/CANNOT mark a run complete/);
-    expect(prompt).toMatch(/edits happen in the web UI/);
+    // The bot must understand it's a coach, not customer support.
+    expect(prompt).toMatch(/accountability partner/i);
+    // The "why this exists" framing must be present so the model knows what
+    // Max actually built this for.
+    expect(prompt).toMatch(/rationaliz/i);
+    // The bot is told to be proactive, not just answer questions.
+    expect(prompt).toMatch(/PROACTIVE/);
+    // Pushback on rationalization is explicit.
+    expect(prompt).toMatch(/push back/i);
   });
 
-  it("includes the ~200 word reply-shape constraint and the no-emoji rule", () => {
+  it("names the technical read-only constraint but frames it as a database limit, not a conversational one", () => {
     const prompt = buildUserChatSystemPrompt(emptyCtx());
-    expect(prompt).toMatch(/200 words MAXIMUM/);
-    expect(prompt).toMatch(/No emoji decoration/);
+    // The bot still must understand it can't write to the DB.
+    expect(prompt).toMatch(/can't write to the database/i);
+    // But it must be framed as a TECHNICAL limit, not a refusal to engage.
+    expect(prompt).toMatch(/TECHNICAL limit/);
+    expect(prompt).toMatch(/not a conversational one/i);
+  });
+
+  it("includes anti-corporate-tone instructions", () => {
+    const prompt = buildUserChatSystemPrompt(emptyCtx());
+    expect(prompt).toMatch(/No corporate help-desk voice/);
+    expect(prompt).toMatch(/great question/);
+    expect(prompt).toMatch(/profanity/i);
   });
 });
