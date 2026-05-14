@@ -252,15 +252,25 @@ async function dispatchClaudeForChat(opts: {
   const env = parseClaudeEnvelope(result.stdout);
   if (!env.ok) throw new Error(env.error);
 
+  // Reply extraction: claude's --json-schema doesn't always populate
+  // structured_output for chat-style prompts — it sometimes emits the natural
+  // language reply directly in `result` instead. Accept either.
+  // Order: structured_output.reply first (schema-conformant), then result.
   const structured = env.envelope.structured_output as
     | { readonly reply?: unknown }
     | undefined;
-  const reply =
-    structured !== undefined && typeof structured.reply === "string"
-      ? structured.reply
-      : "";
+  let reply = "";
+  if (structured !== undefined && typeof structured.reply === "string") {
+    reply = structured.reply;
+  }
+  if (reply.length === 0 && typeof env.envelope.result === "string") {
+    reply = env.envelope.result;
+  }
   if (reply.length === 0) {
-    throw new Error("chat dispatch returned empty reply field");
+    process.stderr.write(
+      `[dispatch-chat] no reply in structured_output or result. raw stdout (last 800): ${result.stdout.slice(-800)}\n`,
+    );
+    throw new Error("chat dispatch returned empty reply");
   }
   const costUsd =
     typeof env.envelope.total_cost_usd === "number"
@@ -540,43 +550,11 @@ export async function bootstrap(): Promise<BootstrapResult> {
     concept2: safeConcept2,
   });
 
-  // Single handler body shared between the bootstrap catch-up sweep
-  // (Phase 5) and the live messageCreate listener so the two paths cannot
-  // drift. Both call sites pass it through to {catchUpOnStartup,
-  // subscribeMessages}; both expect a (match) => Promise<void> shape.
-  const handleMatch = async (match: MessageMatch): Promise<void> => {
-    try {
-      await handleProofMessage({
-        sessionStore: ledger.sessionStore,
-        adapter,
-        sessionId,
-        run: match.run,
-        message: match.message,
-        channelName: match.channelName,
-        now: Date.now(),
-        concept2:
-          concept2 !== null
-            ? {
-                credentials: concept2.credentials,
-                tokens: concept2.tokens,
-                onTokensRefreshed: (newTokens) => {
-                  concept2!.tokens = newTokens;
-                  saveConcept2Tokens(newTokens);
-                },
-              }
-            : null,
-        visionDispatchImpl: dispatchClaudeForCheckin,
-      });
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      logErr(`handleProofMessage exception: ${msg}`);
-    }
-  };
-
   // Phase 4: chat fall-through. Invoked by the listener (and the catch-up
   // sweep) when an active-channel message has no matching pending/partial
-  // run. Routes through handleUserMessage, which loads context, dispatches
-  // Claude, persists the chat events, and posts the reply.
+  // run. ALSO invoked by handleProofMessage's "pending" outcome path when
+  // a message in an active channel isn't an actual proof attempt — lets
+  // the user talk to Claude in any active channel regardless of run state.
   //
   // The whole body is wrapped in try/catch so a listener exception here
   // (e.g. dispatchClaudeForChat throwing) cannot break the messageCreate
@@ -621,6 +599,44 @@ export async function bootstrap(): Promise<BootstrapResult> {
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       logErr(`handleUserMessage exception: ${msg}`);
+    }
+  };
+
+  // Single handler body shared between the bootstrap catch-up sweep
+  // (Phase 5) and the live messageCreate listener so the two paths cannot
+  // drift. Both call sites pass it through to {catchUpOnStartup,
+  // subscribeMessages}; both expect a (match) => Promise<void> shape.
+  //
+  // `onChatFallback` is wired so handleProofMessage's "pending" outcome
+  // (no attachment / no trigger phrase) routes to chat instead of posting
+  // the "send a photo" ack.
+  const handleMatch = async (match: MessageMatch): Promise<void> => {
+    try {
+      await handleProofMessage({
+        sessionStore: ledger.sessionStore,
+        adapter,
+        sessionId,
+        run: match.run,
+        message: match.message,
+        channelName: match.channelName,
+        now: Date.now(),
+        concept2:
+          concept2 !== null
+            ? {
+                credentials: concept2.credentials,
+                tokens: concept2.tokens,
+                onTokensRefreshed: (newTokens) => {
+                  concept2!.tokens = newTokens;
+                  saveConcept2Tokens(newTokens);
+                },
+              }
+            : null,
+        visionDispatchImpl: dispatchClaudeForCheckin,
+        onChatFallback: handleChat,
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      logErr(`handleProofMessage exception: ${msg}`);
     }
   };
 

@@ -61,6 +61,19 @@ export interface HandleProofMessageOptions {
     prompt: string;
     jsonSchema: string;
   }) => Promise<{ structured_output?: unknown; error?: string }>;
+  /**
+   * Optional chat fallback: invoked when verifyProof returns outcome "pending"
+   * (i.e. the message wasn't a proof attempt — no attachment, no trigger
+   * phrase). When provided, the chat handler runs INSTEAD of the
+   * proof_type-tailored pending ack. Lets the user talk to Claude in any
+   * active channel even when a run is open.
+   */
+  readonly onChatFallback?: (opts: {
+    channelId: string;
+    channelName: ChannelName;
+    text: string;
+    message: Message;
+  }) => Promise<void> | void;
 }
 
 interface HabitRowForProof {
@@ -192,10 +205,31 @@ export async function handleProofMessage(
     }
     case "pending":
     default: {
-      // No claim was made (no attachment / phrase mismatch / etc.). Post a
-      // proof_type-tailored ack so the user knows the bot saw them and what
-      // it's still waiting on. If the habit row is somehow missing (shouldn't
-      // happen — we just dispatched on it via verifyProof), skip defensively.
+      // No claim was made (no attachment / phrase mismatch / etc.). The
+      // user is talking to the bot, not submitting proof. If the caller
+      // provided onChatFallback, route to chat instead of posting the
+      // proof_type-tailored "send a photo" ack — lets users converse with
+      // Claude in any active channel regardless of run state.
+      if (opts.onChatFallback !== undefined) {
+        try {
+          const r = opts.onChatFallback({
+            channelId: opts.message.channelId,
+            channelName: opts.channelName,
+            text: opts.message.content ?? "",
+            message: opts.message,
+          });
+          if (r && typeof (r as Promise<void>).then === "function") {
+            await (r as Promise<void>);
+          }
+        } catch (err: unknown) {
+          console.error(
+            `[handle-proof-message] chat fallback failed for run ${opts.run.id}`,
+            err,
+          );
+        }
+        return;
+      }
+      // No chat fallback wired — fall back to the proof_type-tailored ack.
       try {
         const habit = db
           .prepare(`SELECT proof_type FROM habits WHERE id = ?`)

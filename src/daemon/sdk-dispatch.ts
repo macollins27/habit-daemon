@@ -232,10 +232,20 @@ export function dispatchClaude(opts: DispatchOpts): DispatchResult {
     args.push("--append-system-prompt-file", opts.appendSystemPromptFile);
   }
 
+  // Explicit env propagation: --bare requires ANTHROPIC_API_KEY. Without
+  // passing env: process.env, behaviour depends on Node's default-inherit
+  // contract; making it explicit also lets a future env-stripping change
+  // here be visible.
+  if (process.env.ANTHROPIC_API_KEY === undefined) {
+    process.stderr.write(
+      `[dispatch-claude] WARNING: ANTHROPIC_API_KEY missing from process.env — claude --bare will fail auth\n`,
+    );
+  }
   const start = Date.now();
   const result = spawnSync("/usr/bin/env", args, {
     cwd: opts.cwd,
     encoding: "utf8",
+    env: process.env,
     stdio: ["ignore", "pipe", "pipe"],
     timeout: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
   });
