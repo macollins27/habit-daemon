@@ -47,6 +47,35 @@ function err(line: string): void {
   process.stderr.write(line + "\n");
 }
 
+// -----------------------------------------------------------------------------
+// Escalation dispatch backoff (incident 2026-06-02).
+//
+// A habit-checkin dispatch that fails (e.g. the model API is out of credit)
+// used to leave the run perpetually due, so the scheduler re-fired it every
+// tick — a tight retry loop that spawned ~370k dead claude sessions. The
+// scheduler now backs a failing escalation off exponentially, resets on
+// success, and trips a circuit breaker when failures are systemic.
+// -----------------------------------------------------------------------------
+
+export const ESCALATION_BACKOFF_BASE_MS = 60_000; // 1 minute
+export const ESCALATION_BACKOFF_MAX_MS = 6 * 60 * 60 * 1000; // 6 hours
+/** Consecutive escalation dispatch failures in one tick before we stop. */
+export const ESCALATION_CIRCUIT_BREAKER_THRESHOLD = 3;
+
+/**
+ * Exponential backoff for a habit-checkin escalation that has failed
+ * `failureCount` times (1-based). Doubles from the base, capped at the max, so
+ * a persistently-failing run retries at most every few hours instead of every
+ * tick — and self-heals (no hard park) the moment a dispatch succeeds again.
+ */
+export function escalationBackoffMs(failureCount: number): number {
+  const exp = Math.min(Math.max(failureCount - 1, 0), 30);
+  return Math.min(
+    ESCALATION_BACKOFF_BASE_MS * 2 ** exp,
+    ESCALATION_BACKOFF_MAX_MS,
+  );
+}
+
 function listEnabledSchedules(db: Database.Database): readonly ScheduleRow[] {
   return db
     .prepare(
@@ -195,6 +224,7 @@ interface DueHabitRunRow {
   readonly habit_id: string;
   readonly current_level: number;
   readonly fired_at: number;
+  readonly escalation_failure_count: number;
 }
 
 function listDueHabitRuns(
@@ -203,7 +233,7 @@ function listDueHabitRuns(
 ): readonly DueHabitRunRow[] {
   return db
     .prepare(
-      `SELECT id, habit_id, current_level, fired_at
+      `SELECT id, habit_id, current_level, fired_at, escalation_failure_count
        FROM habit_runs
        WHERE next_escalation_at IS NOT NULL
          AND next_escalation_at <= ?
@@ -211,6 +241,51 @@ function listDueHabitRuns(
        ORDER BY fired_at ASC`,
     )
     .all(nowMs) as DueHabitRunRow[];
+}
+
+/**
+ * A habit-checkin dispatch failed. Back the run off (exponential, capped) so a
+ * persistently-failing run no longer re-fires every tick, record the attempt
+ * count and last error. The run self-heals on the next successful dispatch via
+ * `clearEscalationFailureState`.
+ */
+function recordEscalationFailure(
+  db: Database.Database,
+  row: DueHabitRunRow,
+  error: unknown,
+  nowMs: number,
+): void {
+  const newCount = row.escalation_failure_count + 1;
+  const nextEscalationAt = nowMs + escalationBackoffMs(newCount);
+  const msg = (error instanceof Error ? error.message : String(error)).slice(
+    0,
+    500,
+  );
+  db.prepare(
+    `UPDATE habit_runs
+        SET escalation_failure_count = ?,
+            next_escalation_at = ?,
+            last_dispatch_error = ?
+      WHERE id = ?`,
+  ).run(newCount, nextEscalationAt, msg, row.id);
+}
+
+/**
+ * A habit-checkin dispatch succeeded. Clear any prior failure bookkeeping. The
+ * scheduler does NOT touch `next_escalation_at` here — the habit-checkin verb
+ * owns the success cadence (it advanced the level + next_escalation_at inside
+ * its own transaction).
+ */
+function clearEscalationFailureState(
+  db: Database.Database,
+  row: DueHabitRunRow,
+): void {
+  if (row.escalation_failure_count === 0) return;
+  db.prepare(
+    `UPDATE habit_runs
+        SET escalation_failure_count = 0, last_dispatch_error = NULL
+      WHERE id = ?`,
+  ).run(row.id);
 }
 
 /**
@@ -229,17 +304,21 @@ function listDueHabitRuns(
  * priority is unnecessary. Phase B could add `habit_runs.dispatch_priority`
  * if needed.
  *
- * A throwing dispatch is logged to stderr and does NOT halt the loop — the
- * remaining due rows still get their turn. (The verb-level error handling
- * inside `runHabitCheckin` is responsible for whether to retry, mark missed,
- * etc.; the scheduler's only contract is "fire each due row at least once
- * per tick.")
+ * Failure handling (incident 2026-06-02): a throwing dispatch is logged AND
+ * the run is backed off (exponential, capped) by `recordEscalationFailure`, so
+ * a perpetually-failing run (e.g. the model API is out of credit) no longer
+ * re-fires every tick. A successful dispatch clears the failure bookkeeping;
+ * the verb still owns `current_level` / `next_escalation_at` on success. If
+ * `ESCALATION_CIRCUIT_BREAKER_THRESHOLD` dispatches fail back-to-back (a
+ * systemic outage), the rest of this tick's due runs are deferred — they have
+ * already been backed off and will be retried on a later tick.
  */
 async function tickHabitRunEscalations(
   db: Database.Database,
   dispatch: DispatchFn,
   nowMs: number,
 ): Promise<void> {
+  let consecutiveFailures = 0;
   for (const row of listDueHabitRuns(db, nowMs)) {
     const argsJson = JSON.stringify({
       runId: row.id,
@@ -247,11 +326,25 @@ async function tickHabitRunEscalations(
     });
     try {
       await dispatch("habit-checkin", argsJson);
+      clearEscalationFailureState(db, row);
+      consecutiveFailures = 0;
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       err(
-        `[scheduler] habit-checkin dispatch FAILED for run ${row.id}: ${msg.slice(0, 500)}`,
+        `[scheduler] habit-checkin dispatch FAILED for run ${row.id}: ${msg.slice(0, 500)} ` +
+          `(failure #${String(row.escalation_failure_count + 1)}; backing off ` +
+          `${String(Math.round(escalationBackoffMs(row.escalation_failure_count + 1) / 1000))}s)`,
       );
+      recordEscalationFailure(db, row, e, nowMs);
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= ESCALATION_CIRCUIT_BREAKER_THRESHOLD) {
+        err(
+          `[scheduler] escalation circuit breaker tripped after ` +
+            `${String(consecutiveFailures)} consecutive failures; deferring ` +
+            `remaining due runs to a later tick`,
+        );
+        break;
+      }
     }
   }
 }

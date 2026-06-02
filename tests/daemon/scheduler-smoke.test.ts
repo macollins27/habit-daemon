@@ -22,8 +22,10 @@ describe("scheduler tick", () => {
     // habit_runs table is also queried by schedulerTick (Task 32 added
     // next_escalation_at polling). The smoke test only verifies the tick
     // doesn't throw against empty tables — the shape here mirrors
-    // migration 001 (the FK to habits is omitted since habits isn't
-    // created here; SQLite doesn't enforce FKs without PRAGMA anyway).
+    // migration 001 plus the escalation_failure_count column from migration
+    // 007 (which schedulerTick reads in listDueHabitRuns). The FK to habits is
+    // omitted since habits isn't created here; SQLite doesn't enforce FKs
+    // without PRAGMA anyway.
     db.exec(`CREATE TABLE habit_runs (
       id                          TEXT PRIMARY KEY,
       habit_id                    TEXT NOT NULL,
@@ -35,7 +37,8 @@ describe("scheduler tick", () => {
       completed_at                INTEGER,
       proof_payload_json          TEXT,
       skip_reason                 TEXT,
-      proof_rejection_callout_due INTEGER NOT NULL DEFAULT 0
+      proof_rejection_callout_due INTEGER NOT NULL DEFAULT 0,
+      escalation_failure_count    INTEGER NOT NULL DEFAULT 0
     );`);
     await expect(schedulerTick({ db, dispatch: async () => {} })).resolves.not.toThrow();
   });
