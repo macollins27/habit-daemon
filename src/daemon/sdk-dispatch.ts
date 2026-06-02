@@ -213,8 +213,15 @@ export function dispatchClaude(opts: DispatchOpts): DispatchResult {
     String(opts.maxBudgetUsd),
     "--allowedTools",
     opts.allowedTools.join(","),
+    // 2026-05-13: changed from "user,project" to "" — user-level skills like
+    // superpowers:using-superpowers auto-invoke on conversation start, consuming
+    // turn budget and producing error_max_turns before the model can compose the
+    // structured-output JSON. The habit-checkin + vision-verify prompts don't
+    // reference any skill, so empty setting sources is the correct surface here.
+    // If a future dispatch type needs skill resolution, add a settingSources opt
+    // to DispatchOpts and opt in explicitly.
     "--setting-sources",
-    "user,project",
+    "",
     "-p",
     opts.prompt,
   ];
@@ -225,10 +232,20 @@ export function dispatchClaude(opts: DispatchOpts): DispatchResult {
     args.push("--append-system-prompt-file", opts.appendSystemPromptFile);
   }
 
+  // Explicit env propagation: --bare requires ANTHROPIC_API_KEY. Without
+  // passing env: process.env, behaviour depends on Node's default-inherit
+  // contract; making it explicit also lets a future env-stripping change
+  // here be visible.
+  if (process.env.ANTHROPIC_API_KEY === undefined) {
+    process.stderr.write(
+      `[dispatch-claude] WARNING: ANTHROPIC_API_KEY missing from process.env — claude --bare will fail auth\n`,
+    );
+  }
   const start = Date.now();
   const result = spawnSync("/usr/bin/env", args, {
     cwd: opts.cwd,
     encoding: "utf8",
+    env: process.env,
     stdio: ["ignore", "pipe", "pipe"],
     timeout: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
   });

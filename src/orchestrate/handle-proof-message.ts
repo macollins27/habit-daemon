@@ -41,6 +41,8 @@ import {
 import { postWin, type Completion } from "./wins-poster.js";
 import { recordVisionRejection } from "./vision-rejection-counter.js";
 import type { VisionRejection } from "./vision-rejection-counter.js";
+import { postToChannel } from "../lib/discord-adapter.js";
+import { ESCALATION_FOLLOW_UP_CONTENT } from "./habit-checkin.js";
 
 export interface HandleProofMessageOptions {
   readonly sessionStore: SessionStore;
@@ -59,6 +61,19 @@ export interface HandleProofMessageOptions {
     prompt: string;
     jsonSchema: string;
   }) => Promise<{ structured_output?: unknown; error?: string }>;
+  /**
+   * Optional chat fallback: invoked when verifyProof returns outcome "pending"
+   * (i.e. the message wasn't a proof attempt — no attachment, no trigger
+   * phrase). When provided, the chat handler runs INSTEAD of the
+   * proof_type-tailored pending ack. Lets the user talk to Claude in any
+   * active channel even when a run is open.
+   */
+  readonly onChatFallback?: (opts: {
+    channelId: string;
+    channelName: ChannelName;
+    text: string;
+    message: Message;
+  }) => Promise<void> | void;
 }
 
 interface HabitRowForProof {
@@ -128,7 +143,42 @@ export async function handleProofMessage(
 
   switch (result.outcome) {
     case "completed": {
+      // Phase 6.2: read the escalation tracker BEFORE applyCompleted runs
+      // its UPDATE (the UPDATE doesn't clear the column, so order is purely
+      // a defensive choice — fetching first means a future change that
+      // clears the column on completion can't silently regress this check).
+      const lastEscalationMessageId = loadLastEscalationMessageId(
+        db,
+        opts.run.id,
+      );
+
       await applyCompleted(opts, result.proofPayload);
+
+      // Source-channel ack — fires even when buildCompletionForHabit returns
+      // null (the #wins post is skipped in that case, but the user still gets
+      // an in-channel "got it" so they aren't left wondering). Wrapped in an
+      // independent try/catch matching `verify-proof.ts:670-682` so a flaky
+      // channel post never blows up the rest of the handler.
+      //
+      // Phase 6.2 composite: when a prior escalation was tracked, the
+      // follow-up REPLACES the standard ack — a single message reads
+      // better than the two-message version of the same outcome.
+      const ackContent =
+        lastEscalationMessageId !== null
+          ? ESCALATION_FOLLOW_UP_CONTENT
+          : "Got it — see #wins. ✓";
+      try {
+        await postToChannel({
+          adapter: opts.adapter,
+          channel: opts.message.channelId,
+          content: ackContent,
+        });
+      } catch (err: unknown) {
+        console.error(
+          `[handle-proof-message] source-channel completed-ack post failed for run ${opts.run.id}`,
+          err,
+        );
+      }
       return;
     }
     case "partial": {
@@ -138,14 +188,91 @@ export async function handleProofMessage(
     }
     case "rejected": {
       applyRejected(opts, result.proofPayload, result.reason);
+      try {
+        const reason = result.reason ?? "rejected by verifier";
+        await postToChannel({
+          adapter: opts.adapter,
+          channel: opts.message.channelId,
+          content: `That doesn't look right — ${reason}. Try again?`,
+        });
+      } catch (err: unknown) {
+        console.error(
+          `[handle-proof-message] source-channel rejected-ack post failed for run ${opts.run.id}`,
+          err,
+        );
+      }
       return;
     }
     case "pending":
     default: {
-      // No claim was made (no attachment / phrase mismatch / etc.). Wait.
+      // No claim was made (no attachment / phrase mismatch / etc.). The
+      // user is talking to the bot, not submitting proof. If the caller
+      // provided onChatFallback, route to chat instead of posting the
+      // proof_type-tailored "send a photo" ack — lets users converse with
+      // Claude in any active channel regardless of run state.
+      if (opts.onChatFallback !== undefined) {
+        try {
+          const r = opts.onChatFallback({
+            channelId: opts.message.channelId,
+            channelName: opts.channelName,
+            text: opts.message.content ?? "",
+            message: opts.message,
+          });
+          if (r && typeof (r as Promise<void>).then === "function") {
+            await (r as Promise<void>);
+          }
+        } catch (err: unknown) {
+          console.error(
+            `[handle-proof-message] chat fallback failed for run ${opts.run.id}`,
+            err,
+          );
+        }
+        return;
+      }
+      // No chat fallback wired — fall back to the proof_type-tailored ack.
+      try {
+        const habit = db
+          .prepare(`SELECT proof_type FROM habits WHERE id = ?`)
+          .get(opts.run.habit_id) as { proof_type: string } | undefined;
+        if (habit !== undefined) {
+          await postToChannel({
+            adapter: opts.adapter,
+            channel: opts.message.channelId,
+            content: pendingAckText(habit.proof_type),
+          });
+        }
+      } catch (err: unknown) {
+        console.error(
+          `[handle-proof-message] source-channel pending-ack post failed for run ${opts.run.id}`,
+          err,
+        );
+      }
       return;
     }
   }
+}
+
+/**
+ * Phase 6.2: load `habit_runs.last_escalation_message_id` for a run.
+ *
+ * Returns the captured Discord message id of the most recent escalation, or
+ * null if no escalation has been posted for this run yet (rare but possible
+ * — e.g. user posts proof before any scheduler tick fires for the day). The
+ * completed-path ack uses this to pick between the follow-up text and the
+ * standard "Got it" text.
+ */
+function loadLastEscalationMessageId(
+  db: import("better-sqlite3").Database,
+  runId: string,
+): string | null {
+  const row = db
+    .prepare(
+      `SELECT last_escalation_message_id FROM habit_runs WHERE id = ?`,
+    )
+    .get(runId) as
+    | { readonly last_escalation_message_id: string | null }
+    | undefined;
+  return row?.last_escalation_message_id ?? null;
 }
 
 async function applyCompleted(
@@ -290,4 +417,22 @@ function formatStrengthTime(d: Date): string {
   const ampm = d.getHours() >= 12 ? "pm" : "am";
   const m = String(d.getMinutes()).padStart(2, "0");
   return `${weekday ?? "?"} ${h12}:${m}${ampm}`;
+}
+
+/**
+ * Per-proof_type "I see your message, still waiting for proof" text. Used by
+ * the pending-outcome source-channel ack so the user knows the bot saw them
+ * and what specifically it's waiting on. Strings track `seed-habits.ts`.
+ */
+function pendingAckText(proofType: string): string {
+  switch (proofType) {
+    case "concept2_api+photo_fallback":
+      return "I see your message. Don't have proof yet — send a photo of the PM5 or finish the row and it'll sync automatically.";
+    case "typed_msg+garmin_sleep":
+      return "I see your message. Still waiting for either the trigger phrase ('shutting down', etc.) or the Garmin sleep data.";
+    case "training_log_photo":
+      return "I see your message. Send a photo of the training log to mark this done.";
+    default:
+      return "I see your message. Still need proof for this habit.";
+  }
 }

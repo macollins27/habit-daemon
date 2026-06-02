@@ -64,6 +64,10 @@ import {
   type StakeName,
   type WellSelection,
 } from "../lib/why-well-selector.js";
+import { checkProvable } from "./check-provable.js";
+import { formatMorningRowSummary } from "./reconcile-pending-runs.js";
+import type { Concept2Result } from "../lib/concept2-adapter.js";
+import { localDateString } from "../lib/local-date.js";
 
 // -----------------------------------------------------------------------------
 // Per-habit escalation cadence (design § 3).
@@ -73,39 +77,108 @@ import {
 // to schedule L2 we ask for delta(habitId, 1). Encoded for L1..L4 here so
 // later tasks (L2/L3/L4 templates) can reuse the same table. wind-down has
 // no L4→L5 entry because design § 3 says L4 is its terminal level.
+//
+// User-created habits (id = `habit_<slug>` per createHabit) are NOT in this
+// per-habit map. They fall through to `DEFAULT_ESCALATION_DELTA_MINUTES`
+// below — without that fallback the first scheduler tick on any user-created
+// habit throws inside this verb. Same shape as the channel-routing bug
+// fixed in commit 319305f: a closed map keyed on the three Phase-A seed
+// habit ids was load-bearing for arbitrary user slugs.
 // -----------------------------------------------------------------------------
 
 const ESCALATION_DELTA_MINUTES: Readonly<
-  Record<string, Readonly<Record<number, number>>>
+  Record<string, Readonly<Record<number, number | null>>>
 > = {
-  "morning-row": { 1: 30, 2: 30, 3: 30, 4: 30 },
-  "strength-mwf": { 1: 30, 2: 30, 3: 30, 4: 30 },
+  "morning-row": { 1: 30, 2: 30, 3: 30, 4: 30, 5: null },
+  "strength-mwf": { 1: 30, 2: 30, 3: 30, 4: 30, 5: null },
+  // wind-down has no L4 or L5 entry — design § 3 closes the window at L4
+  // (Task 36/37 owns terminal-state evaluation). Keeping the table sparse
+  // preserves the existing fail-fast contract for (wind-down, fromLevel>=4).
   "wind-down": { 1: 8, 2: 5, 3: 2 },
-};
+} as const;
+
+// Default escalation cadence for any habit not enumerated above (user-created
+// habits + any future habit added without its own row). Same shape as the
+// per-habit tables: keys are the level that is CURRENTLY firing; the value is
+// the minutes-to-wait before the next escalation. `null` at L5 signals the
+// terminal step — `runHabitCheckin` separately interprets currentLevel===5 as
+// terminal and writes `next_escalation_at = NULL`, so this null is documented
+// rather than load-bearing on the happy path.
+const DEFAULT_ESCALATION_DELTA_MINUTES: Readonly<
+  Record<number, number | null>
+> = {
+  1: 10,
+  2: 15,
+  3: 30,
+  4: 60,
+  5: null,
+} as const;
 
 export function getEscalationDeltaMinutes(
   habitId: string,
   fromLevel: number,
-): number {
+): number | null {
   const habitMap = ESCALATION_DELTA_MINUTES[habitId];
-  if (habitMap === undefined) {
-    throw new Error(`Unknown habit id for escalation table: ${habitId}`);
+  if (habitMap !== undefined) {
+    const delta = habitMap[fromLevel];
+    if (delta === undefined) {
+      // Known habit with an explicit gap in the table — e.g. wind-down has
+      // no L4 entry per design § 3. Fail-fast preserves Task 30's contract
+      // that an unsupported (habit, level) combination throws atomically.
+      throw new Error(
+        `No escalation delta defined for habit=${habitId} fromLevel=${fromLevel}`,
+      );
+    }
+    return delta;
   }
-  const delta = habitMap[fromLevel];
-  if (delta === undefined) {
+  // Unknown habit id — user-created habit or any future addition without its
+  // own row. Fall back to the default cadence. `null` at L5 signals terminal.
+  const defaultDelta = DEFAULT_ESCALATION_DELTA_MINUTES[fromLevel];
+  if (defaultDelta === undefined) {
     throw new Error(
-      `No escalation delta defined for habit=${habitId} fromLevel=${fromLevel}`,
+      `No default escalation delta defined for fromLevel=${fromLevel}`,
     );
   }
-  return delta;
+  return defaultDelta;
 }
 
 // -----------------------------------------------------------------------------
-// Channel routing: habit.domain → ChannelName.
+// Terminal escalation level per habit.
 //
-// All three Phase A active habits each post to a dedicated channel. The map
-// is kept as a literal `Record<string, ChannelName>` so TypeScript flags
-// missing entries if a future habit ships without a channel.
+// Reaching the terminal level dispatches the final message and closes the run
+// (status='missed', next_escalation_at=NULL, no level advance) — there is no
+// further escalation. morning-row / strength-mwf terminate at L5; wind-down's
+// window closes at L4 (design § 3), so its escalation chain L1→L2→L3→L4 ends
+// there. Without this the verb fell through to `getEscalationDeltaMinutes`,
+// which has no L4 entry for wind-down and threw — and in production that throw
+// made the scheduler re-fire the run every tick forever (incident 2026-06-02).
+// -----------------------------------------------------------------------------
+
+const TERMINAL_LEVEL_BY_HABIT: Readonly<Record<string, number>> = {
+  "wind-down": 4,
+} as const;
+
+const DEFAULT_TERMINAL_LEVEL = 5;
+
+export function terminalLevelFor(habitId: string): number {
+  return TERMINAL_LEVEL_BY_HABIT[habitId] ?? DEFAULT_TERMINAL_LEVEL;
+}
+
+// -----------------------------------------------------------------------------
+// Channel routing: habit row → ChannelName | raw snowflake id.
+//
+// Phase A seed habits (morning-row, strength-mwf, wind-down) have a `domain`
+// in the closed set below and route through the named-channel registry
+// (`adapter.channelIds[name]`). User-created habits (from `createHabit`) use
+// their slug as `domain` — not in the map — and carry the destination Discord
+// snowflake directly on `habits.channel_id`. For those rows we fall back to
+// the raw snowflake; `postToChannel` accepts `ChannelName | string` and
+// resolves either to a snowflake before calling `client.channels.fetch`.
+//
+// Why this matters: without the fallback, the first scheduler tick on any
+// user-created habit throws inside this verb because no DOMAIN_TO_CHANNEL
+// entry exists for arbitrary user slugs. The fallback is load-bearing for
+// chat/web-UI habit creation.
 // -----------------------------------------------------------------------------
 
 const DOMAIN_TO_CHANNEL: Readonly<Record<string, ChannelName>> = {
@@ -114,12 +187,31 @@ const DOMAIN_TO_CHANNEL: Readonly<Record<string, ChannelName>> = {
   "wind-down": "wind-down",
 };
 
-function channelForDomain(domain: string): ChannelName {
-  const name = DOMAIN_TO_CHANNEL[domain];
-  if (name === undefined) {
-    throw new Error(`No channel mapping for habit domain: ${domain}`);
+export interface ChannelRoutingHabit {
+  readonly domain: string;
+  readonly channel_id: string;
+}
+
+/**
+ * Resolve a habit row to the value that should be passed as
+ * `postToChannel.channel`. Phase-A seed habits return a `ChannelName` looked
+ * up via `DOMAIN_TO_CHANNEL`; user-created habits (any domain outside the
+ * closed map) return the raw `habit.channel_id` snowflake.
+ *
+ * Exported for regression-test coverage — production callers reach it
+ * implicitly through `runHabitCheckin`.
+ */
+export function channelForHabit(
+  habit: ChannelRoutingHabit,
+): ChannelName | string {
+  const name = DOMAIN_TO_CHANNEL[habit.domain];
+  if (name !== undefined) {
+    return name;
   }
-  return name;
+  // User-created habit (domain == slug, not in the Phase-A map). The row's
+  // `channel_id` IS the Discord snowflake — postToChannel passes it straight
+  // through to `client.channels.fetch`.
+  return habit.channel_id;
 }
 
 // -----------------------------------------------------------------------------
@@ -151,7 +243,12 @@ export type DispatchImpl = (opts: {
 
 export interface PostImplOptions {
   readonly adapter: DiscordAdapter;
-  readonly channel: ChannelName;
+  // `ChannelName` for Phase-A seed habits routed by name through
+  // `adapter.channelIds`; a raw Discord snowflake string for user-created
+  // habits whose `habits.channel_id` column carries the snowflake directly.
+  // See `channelForHabit` above and `postToChannel`'s resolver in
+  // `src/lib/discord-adapter.ts`.
+  readonly channel: ChannelName | string;
   readonly content: string;
 }
 
@@ -213,7 +310,23 @@ interface RunRowRaw {
   readonly current_level: number;
   readonly status: string;
   readonly proof_rejection_callout_due: number;
+  readonly last_escalation_message_id: string | null;
 }
+
+// -----------------------------------------------------------------------------
+// Phase 6.2: shared follow-up text for autonomous-close paths.
+//
+// When a run is closed by an autonomous path (reconciler, this short-circuit,
+// or handle-proof-message's applyCompleted) AND a prior escalation was tracked
+// (`habit_runs.last_escalation_message_id` is non-null), the daemon posts this
+// brief follow-up in the source channel so the orphaned escalation gets
+// closure pointing at the #wins summary that follows.
+//
+// Exported for cross-path consistency — all three call sites pass this exact
+// string to postToChannel, and the test suite asserts on the constant.
+// -----------------------------------------------------------------------------
+
+export const ESCALATION_FOLLOW_UP_CONTENT = "✓ Proof is in — see #wins.";
 
 // -----------------------------------------------------------------------------
 // Defensive guard helpers (Task 38).
@@ -235,18 +348,6 @@ interface RunRowRaw {
 // -----------------------------------------------------------------------------
 
 const DEFENSIVE_GUARD_DEFER_MS = 60 * 1000;
-
-// YYYY-MM-DD in process local time. Mirrors `localDateString` in
-// discord-adapter.ts — kept local because (a) it is five lines and (b) a
-// cross-module export for a single use would couple the orchestrate layer
-// to the discord layer for no shared behavior.
-function localDateString(epochMs: number): string {
-  const d = new Date(epochMs);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
 
 interface PartialWindDownRow {
   readonly _: 1;
@@ -396,6 +497,40 @@ function loadMissReasons30d(
     classification: r.classification,
     created_at: r.created_at,
   }));
+}
+
+/**
+ * Load the most recent sensor_signals payload for the given source (parsed).
+ * Returns null if no row exists OR if the payload is unparseable. Used by
+ * runHabitCheckin to feed last-night Garmin + latest Concept2 session into
+ * the prompt so the L1 model can cite real numbers.
+ */
+function loadLatestSensorPayload(
+  sessionStore: SessionStore,
+  source: "garmin" | "concept2",
+): Record<string, unknown> | null {
+  const row = sessionStore.db
+    .prepare(
+      `SELECT payload_json, payload_date, fetched_at
+         FROM sensor_signals
+        WHERE source = ?
+        ORDER BY payload_date DESC, fetched_at DESC
+        LIMIT 1`,
+    )
+    .get(source) as { payload_json: string; payload_date: string; fetched_at: number } | undefined;
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.payload_json) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    // Augment with the metadata so the model knows when this data was captured.
+    return {
+      ...(parsed as Record<string, unknown>),
+      _payload_date: row.payload_date,
+      _fetched_at_iso: new Date(row.fetched_at).toISOString(),
+    };
+  } catch {
+    return null;
+  }
 }
 
 function loadGarminSignals30d(
@@ -551,7 +686,7 @@ export async function runHabitCheckin(
   const runRow = db
     .prepare(
       `SELECT id, habit_id, fire_date, fired_at, current_level, status,
-              proof_rejection_callout_due
+              proof_rejection_callout_due, last_escalation_message_id
          FROM habit_runs
         WHERE id = ?`,
     )
@@ -597,6 +732,125 @@ export async function runHabitCheckin(
   };
 
   const calloutFired = run.proof_rejection_callout_due === 1;
+
+  // ---------------------------------------------------------------------------
+  // 2.5. Short-circuit when proof is already in cache (Task 2.2).
+  //
+  // If `checkProvable` finds a qualifying sensor row already on file for
+  // (habit, fire_date) — e.g. Concept2 picked up the user's row that
+  // happened before the escalation tick — close the run NOW. No dispatch,
+  // no escalation. The Phase 1 reconciler covers the same path on its
+  // 2-minute cron; this short-circuit makes the close immediate when
+  // habit-checkin races ahead of the reconciler.
+  //
+  // Layering: this block runs BEFORE the defensive defer guard (§ 2a). If
+  // proof is already on file, closing the run takes precedence over
+  // deferring for partial wind-down — the user already did the thing,
+  // there is nothing to defer.
+  //
+  // Posts to Discord (source channel + #wins) happen AFTER the transaction
+  // commits, mirroring the Phase 1 reconciler's dual-channel pattern. Each
+  // post gets its own try/catch so a flaky channel cannot abort the other
+  // post or leave the run in an inconsistent state — the DB write is
+  // already committed by then.
+  // ---------------------------------------------------------------------------
+  const provable = checkProvable({
+    db,
+    habitId: habit.id,
+    fireDate: run.fire_date,
+  });
+  if (provable.provable) {
+    const proofPayload = {
+      source: provable.source,
+      session: provable.payload,
+      autoDetected: true,
+    };
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE habit_runs
+            SET status = 'completed',
+                completed_at = ?,
+                next_escalation_at = NULL,
+                proof_payload_json = ?
+          WHERE id = ?`,
+      ).run(now, JSON.stringify({ proof: proofPayload }), run.id);
+      sessionStore.append(
+        sessionId,
+        "habit_completed",
+        {
+          habitId: habit.id,
+          runId: run.id,
+          completedAt: now,
+          proofPayload,
+        },
+        { trustLevel: "L1" },
+      );
+    })();
+
+    // Post to source channel + #wins, mirroring the reconciler's
+    // dual-channel pattern. Each call gets its own try/catch so a failing
+    // post can't abort the other or leave the run in an inconsistent state.
+    //
+    // Only Concept2 has a typed session payload right now (checkProvable's
+    // Garmin branch is deferred). When that lands, this block becomes a
+    // switch.
+    if (provable.source === "concept2") {
+      // Phase 6.2: if a prior escalation was tracked for this run, post a
+      // brief follow-up FIRST so the orphaned escalation gets closure
+      // pointing at the #wins summary that follows. Its own try/catch — a
+      // flaky channel here must not block the closure summary posts below.
+      if (runRow.last_escalation_message_id !== null) {
+        try {
+          await postToChannel({
+            adapter: opts.adapter,
+            channel: habitRow.channel_id,
+            content: ESCALATION_FOLLOW_UP_CONTENT,
+          });
+        } catch (err: unknown) {
+          console.error(
+            `[habit-checkin] escalation follow-up post failed for run ${run.id}:`,
+            err,
+          );
+        }
+      }
+
+      const summary = formatMorningRowSummary(
+        provable.payload as unknown as Concept2Result,
+      );
+      try {
+        await postToChannel({
+          adapter: opts.adapter,
+          channel: habitRow.channel_id,
+          content: summary,
+        });
+      } catch (err: unknown) {
+        console.error(
+          `[habit-checkin] source-channel ack failed for run ${run.id}:`,
+          err,
+        );
+      }
+      try {
+        await postToChannel({
+          adapter: opts.adapter,
+          channel: "wins",
+          content: summary,
+        });
+      } catch (err: unknown) {
+        console.error(
+          `[habit-checkin] wins post failed for run ${run.id}:`,
+          err,
+        );
+      }
+    }
+
+    return {
+      dispatched: false,
+      messagePosted: false,
+      newLevel: currentLevel,
+      nextEscalationAt: null,
+      calloutFired: false,
+    };
+  }
 
   // ---------------------------------------------------------------------------
   // 2a. Defensive guard (Task 38, design § 3).
@@ -659,18 +913,19 @@ export async function runHabitCheckin(
 
   const levelTemplate = selectLevelTemplate(currentLevel, { wellSelection });
 
-  // L5 is the TERMINAL escalation step for morning-row / strength-mwf —
-  // after dispatch the run flips to status='missed' and next_escalation_at
-  // becomes NULL. wind-down has no L5 (design § 3 says wind-down closes at
-  // L4); fail-fast here so the verb is side-effect-free for unsupported
-  // (habit, level=5) combinations. Task 36/37 owns wind-down's L4 terminal
-  // state evaluation — that lives in a different verb.
-  const isTerminalLevel = currentLevel === 5;
-  if (isTerminalLevel && habit.id === "wind-down") {
+  // The terminal level dispatches the final message then closes the run
+  // (status='missed', next_escalation_at=NULL, no level advance). It is L5 for
+  // morning-row / strength-mwf and L4 for wind-down (design § 3). A level
+  // BEYOND the habit's terminal (e.g. wind-down L5) is invalid — fail-fast,
+  // side-effect-free, before dispatch / post / DB writes.
+  const terminalLevel = terminalLevelFor(habit.id);
+  if (currentLevel > terminalLevel) {
     throw new Error(
-      "habit-checkin L5 is not supported for wind-down (terminates at L4)",
+      `habit-checkin: ${habit.id} has no level ${currentLevel} ` +
+        `(terminates at L${terminalLevel})`,
     );
   }
+  const isTerminalLevel = currentLevel === terminalLevel;
 
   // Fail-fast cadence lookup: resolve the (habit, level) → delta minutes
   // entry BEFORE we dispatch the model or post to Discord. Both
@@ -683,11 +938,42 @@ export async function runHabitCheckin(
   // L5 skips the lookup entirely: there is no L5→L6 entry in the cadence
   // table because L5 is terminal. The DB transaction sets
   // next_escalation_at = NULL directly.
-  const deltaMinutes = isTerminalLevel
-    ? 0
-    : getEscalationDeltaMinutes(habit.id, currentLevel);
+  //
+  // `getEscalationDeltaMinutes` returns `number | null` so that callers can
+  // distinguish "no further escalation" (null) from a real delta. On the
+  // non-terminal branch we narrow null → throw, because L1..L4 must always
+  // resolve to a real cadence — null at L1..L4 indicates a misconfigured
+  // habit row that the verb should refuse atomically.
+  let deltaMinutes: number;
+  if (isTerminalLevel) {
+    deltaMinutes = 0;
+  } else {
+    const resolved = getEscalationDeltaMinutes(habit.id, currentLevel);
+    if (resolved === null) {
+      throw new Error(
+        `habit-checkin: getEscalationDeltaMinutes returned null at ` +
+          `non-terminal level for habit=${habit.id} fromLevel=${currentLevel}`,
+      );
+    }
+    deltaMinutes = resolved;
+  }
 
   const recentEvents = loadRecentEventsForHabit(sessionStore, habit.id);
+
+  // Always-on context for the model: last night's Garmin payload, the most
+  // recent Concept2 session, and recent miss_reasons. The model is given
+  // raw JSON and trusted to cite specific fields per the L1 voice rules
+  // (which forbid invented numbers). This data is what makes L1 hit on
+  // the first message instead of reading like a generic notification.
+  const garminLastNight = loadLatestSensorPayload(sessionStore, "garmin");
+  const concept2LastSession = loadLatestSensorPayload(sessionStore, "concept2");
+  const recentMissesSnapshot = {
+    misses: loadMissReasons30d(sessionStore, habit.id, now).map((m) => ({
+      miss_date: m.miss_date,
+      classification: m.classification,
+      inferred_specifics: m.inferred_specifics,
+    })),
+  };
 
   const prompt = buildHabitCheckinPrompt({
     habit,
@@ -695,6 +981,11 @@ export async function runHabitCheckin(
     currentLevel,
     recentEvents,
     levelTemplate,
+    sensorSnapshot: {
+      garminLastNight,
+      concept2LastSession,
+    },
+    recentMisses: recentMissesSnapshot,
   });
 
   // ---------------------------------------------------------------------------
@@ -732,12 +1023,33 @@ export async function runHabitCheckin(
   //    writes have happened — the run stays at its current level so the next
   //    scheduler tick retries.
   // ---------------------------------------------------------------------------
-  const channelName = channelForDomain(habit.domain);
-  await postImpl({
+  const channelName = channelForHabit({
+    domain: habit.domain,
+    channel_id: habitRow.channel_id,
+  });
+  const postResult = await postImpl({
     adapter,
     channel: channelName,
     content: messageText,
   });
+
+  // Phase 6.1: record the Discord message id of this escalation so the
+  // completion path can post a follow-up referencing it when a later
+  // autonomous close supersedes the escalation. Fire-and-forget — wrap in
+  // try/catch so a stray DB error never tanks the verb. The post already
+  // succeeded; not recording the id only weakens the follow-up UX.
+  try {
+    db.prepare(
+      `UPDATE habit_runs
+          SET last_escalation_message_id = ?
+        WHERE id = ?`,
+    ).run(postResult.messageId, runId);
+  } catch (err: unknown) {
+    console.error(
+      `[habit-checkin] failed to record last_escalation_message_id for run ${runId}:`,
+      err,
+    );
+  }
 
   // ---------------------------------------------------------------------------
   // 7. Persist atomic state changes.

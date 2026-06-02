@@ -36,13 +36,17 @@ import { runMigrations } from "../db/migrate.js";
 import { loadMigrations } from "../db/load-migrations.js";
 import { seedHabits } from "../db/seed-habits.js";
 import {
+  catchUpOnStartup,
   createDiscordAdapter,
   loadDiscordBotTokenFromEnv,
   loadDiscordChannelIdsFromEnv,
   postToChannel,
   subscribeMessages,
+  type ChannelName,
   type DiscordAdapter,
+  type MessageMatch,
 } from "../lib/discord-adapter.js";
+import type { Message } from "discord.js";
 import { dispatchClaude } from "./sdk-dispatch.js";
 import { parseClaudeEnvelope } from "./verify-footer.js";
 import {
@@ -54,6 +58,7 @@ import {
   type Concept2Tokens,
 } from "../lib/concept2-adapter.js";
 import { syncDate as garminSyncDate } from "../lib/garmin-adapter.js";
+import { localDateString } from "../lib/local-date.js";
 import { createHabitRun } from "../orchestrate/create-habit-run.js";
 import { runHabitCheckin } from "../orchestrate/habit-checkin.js";
 import {
@@ -64,7 +69,12 @@ import {
   retryUnresolvedSensors,
   registerRetryUnresolvedSensorsCron,
 } from "../orchestrate/retry-unresolved-sensors.js";
+import {
+  reconcilePendingRuns,
+  registerReconcilePendingRunsCron,
+} from "../orchestrate/reconcile-pending-runs.js";
 import { handleProofMessage } from "../orchestrate/handle-proof-message.js";
+import { handleUserMessage } from "../orchestrate/handle-user-message.js";
 import type { DispatchFn } from "./scheduler.js";
 
 interface HabitRow {
@@ -155,17 +165,12 @@ function registerHabitMorningCrons(db: Database.Database): number {
 }
 
 /**
- * Local date (process timezone) as YYYY-MM-DD. Matches the convention used by
- * the cron parser (ADR 0001) and other verbs that compute "today" / "yesterday".
+ * Exported for tests in `tests/daemon/` that exercise dispatch routes
+ * without spinning up the full bootstrap (Discord login + env file).
+ * Production callers go through `bootstrap()`, which constructs the same
+ * shape internally.
  */
-function localDateString(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-
-interface DispatchDeps {
+export interface DispatchDeps {
   readonly ledger: Ledger;
   readonly adapter: DiscordAdapter;
   readonly sessionId: string;
@@ -188,12 +193,17 @@ async function dispatchClaudeForCheckin(opts: {
     prompt: opts.prompt,
     jsonSchema: opts.jsonSchema,
     allowedTools: [],
-    maxTurns: 1,
+    // Bumped from 1: `--setting-sources user,project` inherits user-level skills
+    // (e.g. superpowers:using-superpowers) that auto-invoke on conversation start
+    // and produce a tool_use turn. With maxTurns=1, claude hits error_max_turns
+    // before composing the structured-output response. 3 gives budget for: skill
+    // invocation attempt → tool_use denied (allowedTools is empty) → final compose.
+    maxTurns: 3,
     maxBudgetUsd: 0.1,
   });
   if (result.status !== "success" && result.status !== "dry_run") {
     return {
-      error: `claude -p exited ${result.status}: ${(result.stderr ?? "").slice(0, 500)}`,
+      error: `claude -p exited ${result.status} (code=${result.exitCode}): stderr=${(result.stderr ?? "").slice(0, 600)} | stdout=${(result.stdout ?? "").slice(0, 600)}`,
     };
   }
   const env = parseClaudeEnvelope(result.stdout);
@@ -202,10 +212,79 @@ async function dispatchClaudeForCheckin(opts: {
 }
 
 /**
- * Production dispatch map: verb name → in-process orchestration verb. Called
- * by scheduler-daemon.ts's dispatch callback.
+ * Wrap dispatchClaude for the chat orchestrator. Returns the reply text and
+ * the envelope's total_cost_usd so handleUserMessage can record it in
+ * `assistant_message_sent`.
+ *
+ * The system prompt is prepended to the user message (rather than passed via
+ * --append-system-prompt-file) because writing a temp file per chat message
+ * would be wasteful and the model treats prepended instructions equivalently
+ * for a single-turn Q&A. We still enforce a `{reply: string}` JSON schema so
+ * the envelope shape is predictable.
+ *
+ * Throws on any dispatch / parse failure so handleUserMessage's error path
+ * fires and posts the apology message.
  */
-function makeInProcessDispatch(deps: DispatchDeps): DispatchFn {
+async function dispatchClaudeForChat(opts: {
+  readonly system: string;
+  readonly user: string;
+  readonly maxBudgetUsd: number;
+}): Promise<{ text: string; cost_usd: number }> {
+  const jsonSchema = JSON.stringify({
+    type: "object",
+    properties: { reply: { type: "string" } },
+    required: ["reply"],
+    additionalProperties: false,
+  });
+  const result = dispatchClaude({
+    model: "claude-haiku-4-5-20251001",
+    prompt: `${opts.system}\n\n---\n\nUser: ${opts.user}`,
+    jsonSchema,
+    allowedTools: [],
+    maxTurns: 3,
+    maxBudgetUsd: opts.maxBudgetUsd,
+  });
+  if (result.status !== "success" && result.status !== "dry_run") {
+    throw new Error(
+      `claude -p exited ${result.status} (code=${result.exitCode}): stderr=${(result.stderr ?? "").slice(0, 600)} | stdout=${(result.stdout ?? "").slice(0, 600)}`,
+    );
+  }
+  const env = parseClaudeEnvelope(result.stdout);
+  if (!env.ok) throw new Error(env.error);
+
+  // Reply extraction: claude's --json-schema doesn't always populate
+  // structured_output for chat-style prompts — it sometimes emits the natural
+  // language reply directly in `result` instead. Accept either.
+  // Order: structured_output.reply first (schema-conformant), then result.
+  const structured = env.envelope.structured_output as
+    | { readonly reply?: unknown }
+    | undefined;
+  let reply = "";
+  if (structured !== undefined && typeof structured.reply === "string") {
+    reply = structured.reply;
+  }
+  if (reply.length === 0 && typeof env.envelope.result === "string") {
+    reply = env.envelope.result;
+  }
+  if (reply.length === 0) {
+    process.stderr.write(
+      `[dispatch-chat] no reply in structured_output or result. raw stdout (last 800): ${result.stdout.slice(-800)}\n`,
+    );
+    throw new Error("chat dispatch returned empty reply");
+  }
+  const costUsd =
+    typeof env.envelope.total_cost_usd === "number"
+      ? env.envelope.total_cost_usd
+      : 0;
+  return { text: reply, cost_usd: costUsd };
+}
+
+/**
+ * Production dispatch map: verb name → in-process orchestration verb. Called
+ * by scheduler-daemon.ts's dispatch callback. Exported so daemon-wiring
+ * tests can exercise individual dispatch routes against stubbed deps.
+ */
+export function makeInProcessDispatch(deps: DispatchDeps): DispatchFn {
   return async (verb: string, argsJson: string): Promise<void> => {
     const args = JSON.parse(argsJson) as Record<string, unknown>;
     const now = Date.now();
@@ -296,6 +375,68 @@ function makeInProcessDispatch(deps: DispatchDeps): DispatchFn {
         return;
       }
 
+      case "reconcile-pending-runs": {
+        // TZ-aligned Concept2 wrapper. The reconciler reads sensor_signals
+        // keyed by row.fire_date (local YYYY-MM-DD). concept2SyncDate
+        // writes payload_date via toIsoDate(d) = d.toISOString().slice(0,10)
+        // which is the UTC date. To make the two keys agree, we pin the
+        // Date at UTC midnight of the LOCAL date — that way the UTC slice
+        // equals the local YYYY-MM-DD that fire_date uses. See ADR 0001.
+        const concept2Sync = async (date: string): Promise<void> => {
+          const dateForSync = new Date(`${date}T00:00:00Z`);
+          await concept2SyncDate({
+            db: deps.ledger.sessionStore.db,
+            date: dateForSync,
+            credentials: deps.concept2.credentials,
+            tokens: deps.concept2.tokens,
+            onTokensRefreshed: (newTokens) => {
+              deps.concept2.tokens = newTokens;
+              saveConcept2Tokens(newTokens);
+            },
+          });
+        };
+        // Garmin's syncDate already takes a YYYY-MM-DD string. The
+        // reconciler hands us the local date directly — pass it through
+        // so sensor_signals.payload_date matches habit_runs.fire_date.
+        const garminSync = async (date: string): Promise<void> => {
+          await garminSyncDate({
+            db: deps.ledger.sessionStore.db,
+            date,
+            pythonBin: join(homedir(), ".habit-daemon", "venv", "bin", "python"),
+          });
+        };
+        // postToChannel accepts either a ChannelName keyword (looked up in
+        // adapter.channelIds) or a raw snowflake (passed verbatim to
+        // client.channels.fetch). The reconciler emits "wins" for the wins
+        // post and the habit row's snowflake for the source-channel post —
+        // both pass through unchanged. See src/lib/discord-adapter.ts:239+.
+        const postCompletion = async ({
+          channelId,
+          summary,
+        }: {
+          channelId: string;
+          runId: string;
+          summary: string;
+        }): Promise<void> => {
+          await postToChannel({
+            adapter: deps.adapter,
+            channel: channelId,
+            content: summary,
+          });
+        };
+        const result = await reconcilePendingRuns({
+          sessionStore: deps.ledger.sessionStore,
+          now,
+          concept2Sync,
+          garminSync,
+          postCompletion,
+        });
+        logInfo(
+          `reconcile-pending-runs: attempted=${String(result.attempted)} completed=${String(result.completed)} stillPending=${String(result.stillPending)}`,
+        );
+        return;
+      }
+
       default:
         throw new Error(`Unknown verb: ${verb}`);
     }
@@ -307,6 +448,12 @@ export interface BootstrapResult {
   readonly dispatch: DispatchFn;
   readonly sessionId: string;
   readonly cleanup: () => Promise<void>;
+  /**
+   * Live discord adapter. Exposed so the scheduler-daemon main loop can
+   * wire `adapter.isReady` into the HTTP API's /api/health endpoint
+   * without re-constructing or re-importing the adapter module.
+   */
+  readonly adapter: DiscordAdapter;
 }
 
 /**
@@ -374,8 +521,9 @@ export async function bootstrap(): Promise<BootstrapResult> {
   const habitCrons = registerHabitMorningCrons(db);
   registerEvaluateStageBCron(db);
   registerRetryUnresolvedSensorsCron(db);
+  registerReconcilePendingRunsCron(db);
   logInfo(
-    `cron rows registered: ${String(habitCrons)} habit fires + evaluate-stage-b + retry-unresolved-sensors`,
+    `cron rows registered: ${String(habitCrons)} habit fires + evaluate-stage-b + retry-unresolved-sensors + reconcile-pending-runs`,
   );
 
   // Open a daemon-process session.
@@ -402,40 +550,130 @@ export async function bootstrap(): Promise<BootstrapResult> {
     concept2: safeConcept2,
   });
 
+  // Phase 4: chat fall-through. Invoked by the listener (and the catch-up
+  // sweep) when an active-channel message has no matching pending/partial
+  // run. ALSO invoked by handleProofMessage's "pending" outcome path when
+  // a message in an active channel isn't an actual proof attempt — lets
+  // the user talk to Claude in any active channel regardless of run state.
+  //
+  // The whole body is wrapped in try/catch so a listener exception here
+  // (e.g. dispatchClaudeForChat throwing) cannot break the messageCreate
+  // pipeline for subsequent messages.
+  const handleChat = async (args: {
+    readonly channelId: string;
+    readonly channelName: ChannelName | null;
+    readonly text: string;
+    readonly message: Message;
+  }): Promise<void> => {
+    try {
+      // Use the message's createdAt (not Date.now()) so the rate-limit check
+      // operates on the user's actual send time. Critical for catch-up
+      // replay: a batch of queued messages from a restart window must each
+      // be evaluated against when they were ORIGINALLY sent, not when the
+      // daemon happens to be replaying them. Otherwise the first replayed
+      // message writes assistant_message_sent and rate-limits all siblings.
+      const messageNow = args.message.createdAt instanceof Date
+        ? args.message.createdAt.getTime()
+        : Date.now();
+      await handleUserMessage({
+        sessionStore: ledger.sessionStore,
+        channelId: args.channelId,
+        channelName: args.channelName,
+        text: args.text,
+        now: messageNow,
+        dispatchImpl: dispatchClaudeForChat,
+        postImpl: async ({
+          channelId,
+          content,
+        }: {
+          readonly channelId: string;
+          readonly content: string;
+        }) => {
+          await postToChannel({
+            adapter,
+            channel: channelId,
+            content,
+          });
+        },
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      logErr(`handleUserMessage exception: ${msg}`);
+    }
+  };
+
+  // Single handler body shared between the bootstrap catch-up sweep
+  // (Phase 5) and the live messageCreate listener so the two paths cannot
+  // drift. Both call sites pass it through to {catchUpOnStartup,
+  // subscribeMessages}; both expect a (match) => Promise<void> shape.
+  //
+  // `onChatFallback` is wired so handleProofMessage's "pending" outcome
+  // (no attachment / no trigger phrase) routes to chat instead of posting
+  // the "send a photo" ack.
+  const handleMatch = async (match: MessageMatch): Promise<void> => {
+    try {
+      await handleProofMessage({
+        sessionStore: ledger.sessionStore,
+        adapter,
+        sessionId,
+        run: match.run,
+        message: match.message,
+        channelName: match.channelName,
+        now: Date.now(),
+        concept2:
+          concept2 !== null
+            ? {
+                credentials: concept2.credentials,
+                tokens: concept2.tokens,
+                onTokensRefreshed: (newTokens) => {
+                  concept2!.tokens = newTokens;
+                  saveConcept2Tokens(newTokens);
+                },
+              }
+            : null,
+        visionDispatchImpl: dispatchClaudeForCheckin,
+        onChatFallback: handleChat,
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      logErr(`handleProofMessage exception: ${msg}`);
+    }
+  };
+
+  // Phase 5: catch-up sweep. After Discord is ready and BEFORE the live
+  // listener is wired, fetch recent messages from each active channel and
+  // replay anything newer than the persisted cursor. This closes the gap
+  // where a daemon restart drops messageCreate events delivered during the
+  // restart window. Failures are logged + skipped per-channel; the sweep
+  // never propagates an error that would crash bootstrap.
+  try {
+    const catchUpResult = await catchUpOnStartup({
+      adapter,
+      db,
+      handler: handleMatch,
+      chatHandler: handleChat,
+    });
+    logInfo(
+      `discord catch-up: ${catchUpResult.perChannel
+        .map(
+          (r) =>
+            `${r.channelName}=fetched:${String(r.fetched)} replayed:${String(r.replayed)} skipped:${String(r.skipped)}`,
+        )
+        .join("; ")}`,
+    );
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logErr(`discord catch-up failed (continuing bootstrap): ${msg}`);
+  }
+
   // Wire the Discord listener to the proof-message handler. This subscription
   // lasts the lifetime of the daemon process; the returned unsubscribe is
   // exposed via cleanup() so SIGTERM tears it down cleanly.
   const unsubscribe = subscribeMessages({
     adapter,
     db,
-    handler: async (match): Promise<void> => {
-      try {
-        await handleProofMessage({
-          sessionStore: ledger.sessionStore,
-          adapter,
-          sessionId,
-          run: match.run,
-          message: match.message,
-          channelName: match.channelName,
-          now: Date.now(),
-          concept2:
-            concept2 !== null
-              ? {
-                  credentials: concept2.credentials,
-                  tokens: concept2.tokens,
-                  onTokensRefreshed: (newTokens) => {
-                    concept2!.tokens = newTokens;
-                    saveConcept2Tokens(newTokens);
-                  },
-                }
-              : null,
-          visionDispatchImpl: dispatchClaudeForCheckin,
-        });
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        logErr(`handleProofMessage exception: ${msg}`);
-      }
-    },
+    handler: handleMatch,
+    chatHandler: handleChat,
   });
   logInfo(`discord listener subscribed`);
 
@@ -445,5 +683,5 @@ export async function bootstrap(): Promise<BootstrapResult> {
     ledger.close();
   };
 
-  return { ledger, dispatch, sessionId, cleanup };
+  return { ledger, dispatch, sessionId, cleanup, adapter };
 }

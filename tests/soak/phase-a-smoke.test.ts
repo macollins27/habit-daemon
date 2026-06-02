@@ -659,6 +659,7 @@ describe("Phase A soak — stage-B evaluator", () => {
       completed: 1,
       missed: 0,
       noData: 0,
+      stillPending: 0,
     });
 
     // 7. habit_runs.status transitioned to 'completed'.

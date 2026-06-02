@@ -24,6 +24,8 @@ import {
   resolveHeartbeatPath as libResolveHeartbeatPath,
   writeHeartbeat as libWriteHeartbeat,
 } from "./heartbeat.js";
+import { startServer, type ServerHandle } from "../api/server.js";
+import { tokensPath as concept2TokensPath } from "../lib/concept2-adapter.js";
 
 function info(line: string): void {
   process.stdout.write(`[habit-daemon] ${line}\n`);
@@ -113,6 +115,34 @@ export function createLoop(ctx: LoopContext): () => Promise<void> {
   return loop;
 }
 
+/**
+ * Parse the HTTP API port from `HABIT_API_PORT`. Defaults to 8787 (the
+ * port the SPA dev proxy and chat client both expect). Returns the
+ * default rather than throwing when the env var is set but unparseable —
+ * the daemon should still boot, with the port logged so the operator
+ * can correct the misconfiguration.
+ */
+function resolveApiPort(): number {
+  const raw = process.env.HABIT_API_PORT;
+  if (raw === undefined || raw === "") return 8787;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0 || n > 65535) {
+    return 8787;
+  }
+  return n;
+}
+
+/**
+ * Build the concept2 tokens path for /api/health to read. The daemon
+ * source-of-truth lives in `src/lib/concept2-adapter.ts::tokensPath()`,
+ * which honours `$HOME/.habit-daemon/concept2-tokens.json`. We delegate
+ * rather than reimplementing the path math so a future state-dir move
+ * touches one file.
+ */
+function resolveConcept2TokensPath(): string {
+  return concept2TokensPath();
+}
+
 async function main(): Promise<void> {
   const tickIntervalSec = clampInterval(process.env.HABIT_TICK_INTERVAL_SEC, 30, 10);
   const walCheckpointSec = clampInterval(process.env.HABIT_WAL_CHECKPOINT_SEC, 600, 60);
@@ -124,17 +154,62 @@ async function main(): Promise<void> {
   // Bootstrap loads env, opens the ledger, runs migrations, seeds habits,
   // registers cron rows, logs in the Discord client, and returns the
   // in-process verb dispatch function. See src/daemon/bootstrap.ts.
-  const { ledger, dispatch, sessionId, cleanup } = await bootstrap();
+  const { ledger, dispatch, sessionId, cleanup, adapter } = await bootstrap();
   info(`bootstrap complete (session=${sessionId})`);
+
+  // Start the HTTP API alongside the scheduler loop. The API reads
+  // ledger state, the heartbeat-file mtime, the persisted Concept2
+  // tokens file, and the live discord adapter's websocket status —
+  // every dep is wired explicitly here so the API has no implicit
+  // module-level singletons.
+  //
+  // 127.0.0.1 only (enforced inside startServer); never reachable
+  // off-loopback. The port is configurable via HABIT_API_PORT, but
+  // 8787 matches the SPA dev proxy + chat client default.
+  const apiPort = resolveApiPort();
+  const apiServer: ServerHandle = await startServer(
+    {
+      sessionStore: ledger.sessionStore,
+      heartbeatPath,
+      discordConnected: (): boolean => adapter.isReady(),
+      concept2TokensPath: resolveConcept2TokensPath(),
+    },
+    apiPort,
+  );
+  info(`HTTP API listening on 127.0.0.1:${String(apiServer.port)}`);
 
   // sd_notify READY=1 (systemd Type=notify required signal; no-op on launchd)
   sdNotifyViaCli("READY=1");
 
+  // `shuttingDown` guards against a double-fired signal (SIGTERM followed by
+  // a second SIGTERM or SIGINT during the same shutdown window). The second
+  // invocation must not double-close the API server or re-invoke `cleanup`
+  // — discord.js's `destroy()` and the better-sqlite3 close are both
+  // idempotent in principle, but the API listener's underlying Node Server
+  // throws on a second `close()` call.
   let stop = false;
+  let shuttingDown = false;
   const onSignal = (sig: string): void => {
+    if (shuttingDown) {
+      info(`received ${sig} during shutdown; ignoring`);
+      return;
+    }
+    shuttingDown = true;
     info(`received ${sig}, shutting down`);
     sdNotifyViaCli("STOPPING=1");
     stop = true;
+
+    // Close the HTTP listener first so no in-flight request can observe
+    // the ledger after we've started tearing it down. Wrapped in try/catch
+    // because the downstream cleanups (discord, ledger) MUST run even if
+    // the API close throws.
+    try {
+      apiServer.close();
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      err(`api server close exception during ${sig}: ${msg}`);
+    }
+
     cleanup().catch((e: unknown) => {
       const msg = e instanceof Error ? e.message : String(e);
       err(`cleanup exception during ${sig}: ${msg}`);

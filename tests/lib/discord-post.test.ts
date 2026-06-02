@@ -28,7 +28,6 @@ import { AttachmentBuilder, type Client } from "discord.js";
 import {
   createDiscordAdapter,
   postToChannel,
-  type ChannelName,
   type DiscordAdapter,
   type DiscordChannelIds,
 } from "../../src/lib/discord-adapter.js";
@@ -157,16 +156,23 @@ describe("postToChannel()", () => {
     });
   });
 
-  it("throws when an unknown channel name is forced past the type system", async () => {
-    const { adapter } = buildAdapter();
+  it("passes a non-registered channel value through to client.channels.fetch verbatim (raw-snowflake path for user-created habits)", async () => {
+    // Contract: `postToChannel.channel` accepts `ChannelName | string`. When
+    // the value is NOT a registered `ChannelName`, it is treated as a raw
+    // Discord snowflake id and passed to `client.channels.fetch` unchanged.
+    // This is the path user-created habits take — their `habits.channel_id`
+    // is the snowflake itself, not a name registered in `adapter.channelIds`.
+    const { adapter, mockClient } = buildAdapter();
 
-    await expect(
-      postToChannel({
-        adapter,
-        channel: "nope" as ChannelName,
-        content: "x",
-      }),
-    ).rejects.toThrow(/channel/i);
+    await postToChannel({
+      adapter,
+      channel: "9999999999999999999",
+      content: "x",
+    });
+
+    expect(mockClient.channels.fetch).toHaveBeenCalledWith(
+      "9999999999999999999",
+    );
   });
 
   it("throws a descriptive error when channels.fetch returns null", async () => {

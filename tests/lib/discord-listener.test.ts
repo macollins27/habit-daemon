@@ -115,21 +115,31 @@ function makeMockClient(): MockClient {
 
 // -----------------------------------------------------------------------------
 // Synthetic Message constructor. We only populate the fields the listener
-// reads (`channelId`, `author.bot`, and an `id` for debug parity).
+// reads (`channelId`, `author.bot`, attachments.size, content, and an `id`
+// for debug parity).
+//
+// Single-channel mode: the listener now pre-filters by message shape. A
+// morning-row / strength run only accepts a message WITH an attachment; a
+// wind-down run only accepts text containing the trigger phrase. Tests
+// that want the proof handler to fire must opt into one of those shapes.
 // -----------------------------------------------------------------------------
 interface FakeMessageOptions {
   readonly channelId: string;
   readonly bot?: boolean;
   readonly id?: string;
   readonly content?: string;
+  /** Sets attachments.size = 1 (or 0) so the pre-filter sees a photo. */
+  readonly hasAttachment?: boolean;
 }
 
 function makeMessage(opts: FakeMessageOptions): Message {
+  const size = opts.hasAttachment ? 1 : 0;
   return {
     id: opts.id ?? "m-" + randomUUID(),
     channelId: opts.channelId,
     content: opts.content ?? "hi",
     author: { bot: opts.bot ?? false },
+    attachments: { size },
   } as unknown as Message;
 }
 
@@ -307,7 +317,12 @@ describe("subscribeMessages()", () => {
       now: () => h.now,
     });
 
-    const msg = makeMessage({ channelId: CH_MORNING_ROW, content: "rowed" });
+    // Pre-filter requires an attachment for `concept2_api+photo_fallback`.
+    const msg = makeMessage({
+      channelId: CH_MORNING_ROW,
+      content: "rowed",
+      hasAttachment: true,
+    });
     h.mockClient.emit(msg);
 
     expect(handler).toHaveBeenCalledTimes(1);
@@ -338,7 +353,10 @@ describe("subscribeMessages()", () => {
       now: () => h.now,
     });
 
-    h.mockClient.emit(makeMessage({ channelId: CH_WIND_DOWN }));
+    // Pre-filter requires the wind-down trigger phrase "shutting down".
+    h.mockClient.emit(
+      makeMessage({ channelId: CH_WIND_DOWN, content: "shutting down for the night" }),
+    );
 
     expect(handler).toHaveBeenCalledTimes(1);
     const arg = handler.mock.calls[0]![0] as MessageMatch;
@@ -420,7 +438,9 @@ describe("subscribeMessages()", () => {
       now: () => tomorrow,
     });
 
-    h.mockClient.emit(makeMessage({ channelId: CH_MORNING_ROW }));
+    h.mockClient.emit(
+      makeMessage({ channelId: CH_MORNING_ROW, hasAttachment: true }),
+    );
 
     expect(handler).toHaveBeenCalledTimes(1);
     const arg = handler.mock.calls[0]![0] as MessageMatch;
@@ -460,8 +480,13 @@ describe("subscribeMessages()", () => {
       now: () => h.now,
     });
 
-    h.mockClient.emit(makeMessage({ channelId: CH_MORNING_ROW }));
-    h.mockClient.emit(makeMessage({ channelId: CH_STRENGTH }));
+    // Both morning-row and strength accept attachments — pre-filter passes.
+    h.mockClient.emit(
+      makeMessage({ channelId: CH_MORNING_ROW, hasAttachment: true }),
+    );
+    h.mockClient.emit(
+      makeMessage({ channelId: CH_STRENGTH, hasAttachment: true }),
+    );
 
     // Allow the rejected promise (caught inside the listener) to settle.
     await new Promise((r) => setImmediate(r));
@@ -498,8 +523,12 @@ describe("subscribeMessages()", () => {
       now: () => h.now,
     });
 
-    h.mockClient.emit(makeMessage({ channelId: CH_MORNING_ROW }));
-    h.mockClient.emit(makeMessage({ channelId: CH_STRENGTH }));
+    h.mockClient.emit(
+      makeMessage({ channelId: CH_MORNING_ROW, hasAttachment: true }),
+    );
+    h.mockClient.emit(
+      makeMessage({ channelId: CH_STRENGTH, hasAttachment: true }),
+    );
 
     expect(handler).toHaveBeenCalledTimes(2);
     const first = handler.mock.calls[0]![0] as MessageMatch;

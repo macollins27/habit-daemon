@@ -1,10 +1,13 @@
 node_modules/
 dist/
+.worktrees/
 habit-state.db*
 .env
 ~/.habit-daemon/
 .DS_Store
 *.log
+__pycache__/
+*.pyc
 docs/*
 !docs/decisions/
 !docs/decisions/**

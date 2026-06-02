@@ -353,8 +353,37 @@ export async function fetchRowsBetween(
     if (!Array.isArray(parsed.data)) {
       throw new Error("Concept2 results response missing data array");
     }
-    for (const row of parsed.data) {
-      allRows.push(row as Concept2Result);
+    for (const rawRow of parsed.data) {
+      // Concept2 API returns raw fields named `time` (in deciseconds —
+      // tenths of a second, per their API docs) and `distance` (in meters).
+      // Our internal Concept2Result type uses `duration_seconds` and
+      // `distance_meters` so downstream code (findQualifyingSession, the
+      // prompt-builder, the proof verifier) doesn't have to know about the
+      // wire format. Transform here once at the API boundary.
+      //
+      // Defensive: if the row already carries the internal field names
+      // (older cached payloads, fixture data), prefer those — the
+      // transformation is a one-way upgrade.
+      const r = rawRow as Record<string, unknown>;
+      const durationSec =
+        typeof r.duration_seconds === "number"
+          ? r.duration_seconds
+          : typeof r.time === "number"
+            ? r.time / 10
+            : 0;
+      const distanceM =
+        typeof r.distance_meters === "number"
+          ? r.distance_meters
+          : typeof r.distance === "number"
+            ? r.distance
+            : 0;
+      allRows.push({
+        id: typeof r.id === "number" ? r.id : 0,
+        date: typeof r.date === "string" ? r.date : "",
+        type: typeof r.type === "string" ? r.type : "",
+        duration_seconds: durationSec,
+        distance_meters: distanceM,
+      });
     }
 
     const links = parsed.links;
