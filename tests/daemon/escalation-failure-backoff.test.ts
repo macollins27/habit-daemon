@@ -19,7 +19,25 @@ import {
   schedulerTick,
   escalationBackoffMs,
   ESCALATION_CIRCUIT_BREAKER_THRESHOLD,
+  MAX_ESCALATION_ATTEMPTS,
+  ESCALATION_BREAKER_BASE_COOLDOWN_MS,
 } from "../../src/daemon/scheduler.js";
+
+interface BreakerRow {
+  readonly state: string;
+  readonly consecutive_failures: number;
+  readonly opened_at: number | null;
+  readonly probe_cooldown_ms: number;
+}
+
+function getBreaker(db: Database.Database): BreakerRow {
+  return db
+    .prepare(
+      `SELECT state, consecutive_failures, opened_at, probe_cooldown_ms
+         FROM escalation_breaker WHERE id = 1`,
+    )
+    .get() as BreakerRow;
+}
 
 const SEED_CHANNELS = {
   morningRow: "1000000000000000001",
@@ -187,5 +205,73 @@ describe("schedulerTick — escalation failure backoff (incident 2026-06-02)", (
     // Only THRESHOLD dispatches attempted before the breaker trips; the rest
     // are deferred to the next tick (and have already backed off).
     expect(countHabitCheckins(dispatch)).toBe(ESCALATION_CIRCUIT_BREAKER_THRESHOLD);
+  });
+
+  it("parks a run after MAX_ESCALATION_ATTEMPTS consecutive failures (gives up)", async () => {
+    seedHabitRun(db, {
+      runId: "run-doomed",
+      habitId: "morning-row",
+      nextEscalationAt: NOW_MS - 60 * 1000,
+      escalationFailureCount: MAX_ESCALATION_ATTEMPTS - 1,
+    });
+    const dispatch = vi.fn(async (verb: string) => {
+      if (verb === "habit-checkin") throw new Error("never going to work");
+    });
+
+    await schedulerTick({ db, dispatch });
+
+    const run = getRun(db, "run-doomed");
+    expect(run.escalation_failure_count).toBe(MAX_ESCALATION_ATTEMPTS);
+    // Parked: NULL next_escalation_at means it is no longer due — it stops
+    // retrying entirely rather than trickling forever.
+    expect(run.next_escalation_at).toBeNull();
+  });
+
+  it("the breaker OPENS after the threshold and a within-cooldown tick dispatches NOTHING", async () => {
+    for (let i = 0; i < ESCALATION_CIRCUIT_BREAKER_THRESHOLD + 2; i++) {
+      seedHabitRun(db, {
+        runId: `r-${i}`,
+        habitId: "morning-row",
+        fireDate: `2026-03-${String(i + 1).padStart(2, "0")}`,
+        firedAt: NOW_MS - (100 - i) * 60 * 1000,
+        nextEscalationAt: NOW_MS - 60 * 1000,
+      });
+    }
+    const failing = vi.fn(async (verb: string) => {
+      if (verb === "habit-checkin") throw new Error("systemic outage");
+    });
+
+    // Tick 1: trips the breaker.
+    await schedulerTick({ db, dispatch: failing });
+    expect(getBreaker(db).state).toBe("open");
+
+    // Tick 2 (same clock → still within cooldown): ZERO dispatches.
+    const second = vi.fn(async () => {});
+    await schedulerTick({ db, dispatch: second });
+    expect(countHabitCheckins(second)).toBe(0);
+  });
+
+  it("a half-open probe that succeeds CLOSES the breaker and resumes", async () => {
+    // Force the breaker open with an elapsed cooldown so this tick probes.
+    db.prepare(
+      `UPDATE escalation_breaker
+          SET state = 'open', consecutive_failures = ?, opened_at = ?, probe_cooldown_ms = ?
+        WHERE id = 1`,
+    ).run(
+      ESCALATION_CIRCUIT_BREAKER_THRESHOLD,
+      NOW_MS - ESCALATION_BREAKER_BASE_COOLDOWN_MS - 1000, // cooldown already elapsed
+      ESCALATION_BREAKER_BASE_COOLDOWN_MS,
+    );
+    seedHabitRun(db, {
+      runId: "run-probe",
+      habitId: "morning-row",
+      nextEscalationAt: NOW_MS - 60 * 1000,
+    });
+    const ok = vi.fn(async () => {}); // dispatch succeeds → recovery
+
+    await schedulerTick({ db, dispatch: ok });
+
+    expect(countHabitCheckins(ok)).toBeGreaterThanOrEqual(1); // probe fired
+    expect(getBreaker(db).state).toBe("closed");
   });
 });
