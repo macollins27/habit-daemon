@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc && mkdir -p dist/db/migrations && cp src/db/migrations/*.sql dist/db/migrations/",
+    "build": "rm -rf dist && tsc && mkdir -p dist/db/migrations && cp src/db/migrations/*.sql dist/db/migrations/",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
