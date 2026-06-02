@@ -320,38 +320,57 @@ describe("runHabitCheckin() at L4", () => {
     expect(row?.next_escalation_at).toBe(NOW_MS + 30 * 60 * 1000);
   });
 
-  it("wind-down L4: throws (no L4→L5 transition), no dispatch, no post, no DB writes", async () => {
+  it("wind-down L4 is TERMINAL: dispatches the final message then closes the run (status='missed')", async () => {
+    // L4 is wind-down's terminal level (design § 3: the window closes at L4).
+    // Its escalation chain L1→L2→L3→L4 ends here, so L4 mirrors L5 for the
+    // other habits: dispatch the final message, then close. Previously the
+    // verb threw at the getEscalationDeltaMinutes gap, which in production made
+    // the scheduler re-fire the run every tick forever (incident 2026-06-02).
     seedHabitRun(db, {
       runId: "run-wd-l4",
       habitId: "wind-down",
       currentLevel: 4,
     });
-    const { adapter, mockSend } = buildAdapter();
+    const { adapter, mockSend, mockFetch } = buildAdapter();
     const { impl, calls } = happyDispatch();
-    const eventsBefore = countEvents(db);
 
-    await expect(
-      runHabitCheckin({
-        sessionStore,
-        adapter,
-        sessionId: SESSION_ID,
-        runId: "run-wd-l4",
-        currentLevel: 4,
-        now: NOW_MS,
-        dispatchImpl: impl,
-      }),
-    ).rejects.toThrowError();
+    const result = await runHabitCheckin({
+      sessionStore,
+      adapter,
+      sessionId: SESSION_ID,
+      runId: "run-wd-l4",
+      currentLevel: 4,
+      now: NOW_MS,
+      dispatchImpl: impl,
+    });
 
-    // Fail-fast contract: getEscalationDeltaMinutes is called immediately
-    // after template selection, BEFORE dispatch and BEFORE the Discord
-    // post. An unsupported (habit, level) combination (wind-down L4) must
-    // throw with no side effects whatsoever.
-    expect(calls.length).toBe(0);
-    expect(mockSend).not.toHaveBeenCalled();
+    // Final message dispatched + posted to the wind-down channel.
+    expect(calls.length).toBe(1);
+    expect(mockFetch).toHaveBeenCalledWith(CHANNEL_IDS["wind-down"]);
+    expect(mockSend).toHaveBeenCalledTimes(1);
+
+    // Terminal transition: no level advance, no further escalation, missed.
     const row = getRun(db, "run-wd-l4");
     expect(row?.current_level).toBe(4);
     expect(row?.next_escalation_at).toBeNull();
-    expect(countEvents(db)).toBe(eventsBefore);
+    expect(row?.status).toBe("missed");
+
+    const events = getSessionEvents(db, SESSION_ID);
+    expect(events.length).toBe(1);
+    const payload = JSON.parse(events[0].event_json) as {
+      level: number;
+      terminal: boolean;
+    };
+    expect(payload.level).toBe(4);
+    expect(payload.terminal).toBe(true);
+
+    expect(result).toEqual({
+      dispatched: true,
+      messagePosted: true,
+      newLevel: 4,
+      nextEscalationAt: null,
+      calloutFired: false,
+    });
   });
 
   it("L4 prompt does NOT include new WHY content (no stakes / body data / patterns)", async () => {

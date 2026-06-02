@@ -143,6 +143,28 @@ export function getEscalationDeltaMinutes(
 }
 
 // -----------------------------------------------------------------------------
+// Terminal escalation level per habit.
+//
+// Reaching the terminal level dispatches the final message and closes the run
+// (status='missed', next_escalation_at=NULL, no level advance) — there is no
+// further escalation. morning-row / strength-mwf terminate at L5; wind-down's
+// window closes at L4 (design § 3), so its escalation chain L1→L2→L3→L4 ends
+// there. Without this the verb fell through to `getEscalationDeltaMinutes`,
+// which has no L4 entry for wind-down and threw — and in production that throw
+// made the scheduler re-fire the run every tick forever (incident 2026-06-02).
+// -----------------------------------------------------------------------------
+
+const TERMINAL_LEVEL_BY_HABIT: Readonly<Record<string, number>> = {
+  "wind-down": 4,
+} as const;
+
+const DEFAULT_TERMINAL_LEVEL = 5;
+
+export function terminalLevelFor(habitId: string): number {
+  return TERMINAL_LEVEL_BY_HABIT[habitId] ?? DEFAULT_TERMINAL_LEVEL;
+}
+
+// -----------------------------------------------------------------------------
 // Channel routing: habit row → ChannelName | raw snowflake id.
 //
 // Phase A seed habits (morning-row, strength-mwf, wind-down) have a `domain`
@@ -891,18 +913,19 @@ export async function runHabitCheckin(
 
   const levelTemplate = selectLevelTemplate(currentLevel, { wellSelection });
 
-  // L5 is the TERMINAL escalation step for morning-row / strength-mwf —
-  // after dispatch the run flips to status='missed' and next_escalation_at
-  // becomes NULL. wind-down has no L5 (design § 3 says wind-down closes at
-  // L4); fail-fast here so the verb is side-effect-free for unsupported
-  // (habit, level=5) combinations. Task 36/37 owns wind-down's L4 terminal
-  // state evaluation — that lives in a different verb.
-  const isTerminalLevel = currentLevel === 5;
-  if (isTerminalLevel && habit.id === "wind-down") {
+  // The terminal level dispatches the final message then closes the run
+  // (status='missed', next_escalation_at=NULL, no level advance). It is L5 for
+  // morning-row / strength-mwf and L4 for wind-down (design § 3). A level
+  // BEYOND the habit's terminal (e.g. wind-down L5) is invalid — fail-fast,
+  // side-effect-free, before dispatch / post / DB writes.
+  const terminalLevel = terminalLevelFor(habit.id);
+  if (currentLevel > terminalLevel) {
     throw new Error(
-      "habit-checkin L5 is not supported for wind-down (terminates at L4)",
+      `habit-checkin: ${habit.id} has no level ${currentLevel} ` +
+        `(terminates at L${terminalLevel})`,
     );
   }
+  const isTerminalLevel = currentLevel === terminalLevel;
 
   // Fail-fast cadence lookup: resolve the (habit, level) → delta minutes
   // entry BEFORE we dispatch the model or post to Discord. Both
