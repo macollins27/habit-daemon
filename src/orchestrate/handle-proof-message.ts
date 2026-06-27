@@ -37,6 +37,7 @@ import {
   makeVerifyConcept2OrPhoto,
   makeVerifyTrainingLogPhoto,
   makeVerifyWindDownStageA,
+  makeVerifyAlignmentText,
 } from "./verify-proof.js";
 import { postWin, type Completion } from "./wins-poster.js";
 import { recordVisionRejection } from "./vision-rejection-counter.js";
@@ -125,6 +126,9 @@ export async function handleProofMessage(
   const verifyWindDown = makeVerifyWindDownStageA({
     adapter: opts.adapter,
   });
+  const verifyAlignmentText = makeVerifyAlignmentText({
+    dispatchImpl: opts.visionDispatchImpl,
+  });
 
   const result = await verifyProof({
     db,
@@ -138,6 +142,7 @@ export async function handleProofMessage(
       verifyConcept2OrPhoto: verifyConcept2,
       verifyTrainingLogPhoto: verifyTrainingLog,
       verifyWindDownStageA: verifyWindDown,
+      verifyAlignmentText,
     },
   });
 
@@ -432,6 +437,8 @@ function pendingAckText(proofType: string): string {
       return "I see your message. Still waiting for either the trigger phrase ('shutting down', etc.) or the Garmin sleep data.";
     case "training_log_photo":
       return "I see your message. Send a photo of the training log to mark this done.";
+    case "alignment_text":
+      return "I see your message. To close the checkpoint, answer all four: what you're avoiding, the smallest real start, your 3 wins, and the habit interfering today.";
     default:
       return "I see your message. Still need proof for this habit.";
   }

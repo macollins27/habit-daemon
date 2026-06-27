@@ -31,6 +31,7 @@ export const ProofTypeEnum = z.enum([
   "concept2_api+photo_fallback",
   "training_log_photo",
   "typed_msg+garmin_sleep",
+  "alignment_text",
 ]);
 
 export type ProofType = z.infer<typeof ProofTypeEnum>;

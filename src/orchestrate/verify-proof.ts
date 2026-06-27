@@ -45,6 +45,7 @@ import {
   verifyImage,
   type DispatchResult as VisionDispatchResult,
 } from "../lib/vision-verify.js";
+import { verifyAlignment } from "../lib/alignment-verify.js";
 import { findQualifyingSession } from "./verify-proof-internals.js";
 
 // -----------------------------------------------------------------------------
@@ -58,7 +59,8 @@ import { findQualifyingSession } from "./verify-proof-internals.js";
 export type ProofType =
   | "concept2_api+photo_fallback"
   | "training_log_photo"
-  | "typed_msg+garmin_sleep";
+  | "typed_msg+garmin_sleep"
+  | "alignment_text";
 
 /**
  * Result envelope returned by every sub-verb. The router forwards this
@@ -114,6 +116,7 @@ export interface VerifyProofOptions extends SubVerbContext {
     readonly verifyConcept2OrPhoto?: SubVerb;
     readonly verifyTrainingLogPhoto?: SubVerb;
     readonly verifyWindDownStageA?: SubVerb;
+    readonly verifyAlignmentText?: SubVerb;
   };
 }
 
@@ -158,6 +161,11 @@ function pickSubVerb(
       return {
         name: "verifyWindDownStageA",
         verb: subVerbs?.verifyWindDownStageA,
+      };
+    case "alignment_text":
+      return {
+        name: "verifyAlignmentText",
+        verb: subVerbs?.verifyAlignmentText,
       };
     default:
       throw new Error(`Unknown proof_type: ${proofType}`);
@@ -682,5 +690,61 @@ export function makeVerifyWindDownStageA(
     }
 
     return { outcome: "partial", proofPayload: proofData };
+  };
+}
+
+// -----------------------------------------------------------------------------
+// verifyAlignmentText sub-verb.
+// -----------------------------------------------------------------------------
+//
+// Sub-verb for `proof_type = alignment_text` (daily-alignment). The proof is
+// the user's free-text answer to the four checkpoint questions, judged for
+// substance by Claude (src/lib/alignment-verify.ts) — the text analogue of the
+// photo sub-verbs.
+//
+// Consistent with the concept2 / training-log sub-verbs: this returns a
+// VerifyProofResult envelope and performs NO DB writes or Discord side effects.
+// The caller (handleProofMessage) translates `completed`/`rejected` into the
+// status transition (which sets next_escalation_at=NULL and stops the texts)
+// and the acks.
+
+export interface VerifyAlignmentTextDeps {
+  /** Test seam for the Claude judge dispatch. Production falls through to the
+   *  real `claude -p` chain inside `verifyAlignment`. */
+  readonly dispatchImpl?: (opts: {
+    prompt: string;
+    jsonSchema: string;
+  }) => Promise<VisionDispatchResult>;
+}
+
+/**
+ * Factory for the daily-alignment free-text sub-verb. Closes over the judge
+ * dispatch impl so the router can hand the same configured verb to every
+ * invocation.
+ */
+export function makeVerifyAlignmentText(
+  deps: VerifyAlignmentTextDeps,
+): SubVerb {
+  return async function verifyAlignmentText(
+    ctx: SubVerbContext,
+  ): Promise<VerifyProofResult> {
+    const text = ctx.message.content ?? "";
+
+    const verdict = await verifyAlignment({
+      text,
+      dispatchImpl: deps.dispatchImpl,
+    });
+
+    if (verdict.accepted) {
+      return {
+        outcome: "completed",
+        proofPayload: { source: "alignment_text", parsed: verdict.parsed },
+      };
+    }
+    return {
+      outcome: "rejected",
+      reason: verdict.reason,
+      proofPayload: { source: "alignment_text", parsed: verdict.parsed },
+    };
   };
 }

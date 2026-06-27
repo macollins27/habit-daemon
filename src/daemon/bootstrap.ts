@@ -34,7 +34,13 @@ import { Ledger } from "./ledger.js";
 import { SessionStore } from "./session-store.js";
 import { runMigrations } from "../db/migrate.js";
 import { loadMigrations } from "../db/load-migrations.js";
-import { seedHabits } from "../db/seed-habits.js";
+import { seedHabits, seedAlignmentHabit } from "../db/seed-habits.js";
+import {
+  loadSmsConfigFromEnv,
+  type SmsConfig,
+} from "../lib/sms-config.js";
+import { sendText as sendImessageText } from "../lib/imessage-adapter.js";
+import { runAlignmentCheckin } from "../orchestrate/alignment-checkin.js";
 import {
   catchUpOnStartup,
   createDiscordAdapter,
@@ -178,7 +184,23 @@ export interface DispatchDeps {
     readonly credentials: Concept2Credentials;
     tokens: Concept2Tokens;
   };
+  /**
+   * SMS/iMessage transport config for the daily-alignment habit. Optional so
+   * daemon-wiring tests can construct DispatchDeps without it; defaults to
+   * disabled, which makes the alignment escalation path inert (and it never
+   * fires anyway unless the alignment habit has been seeded).
+   */
+  readonly sms?: SmsConfig;
 }
+
+const DISABLED_SMS_CONFIG: SmsConfig = {
+  enabled: false,
+  toNumber: null,
+  quietHoursStart: null,
+  quietHoursEnd: null,
+  maxPerDay: 12,
+  minIntervalMinutes: 10,
+};
 
 /**
  * Wrap dispatchClaude + parseClaudeEnvelope into the shape habit-checkin
@@ -314,6 +336,48 @@ export function makeInProcessDispatch(deps: DispatchDeps): DispatchFn {
         if (!runId || currentLevel === null) {
           throw new Error(`habit-checkin: missing/invalid runId or currentLevel`);
         }
+
+        // Route the daily-alignment habit to its dedicated, fail-soft
+        // escalation engine (fixed copy, hourly cadence, capped iMessage
+        // transport). All other habits use the level/sensor engine unchanged.
+        const domainRow = deps.ledger.sessionStore.db
+          .prepare(
+            `SELECT h.domain FROM habit_runs r JOIN habits h ON h.id = r.habit_id WHERE r.id = ?`,
+          )
+          .get(runId) as { domain: string } | undefined;
+        if (domainRow?.domain === "alignment") {
+          const sms = deps.sms ?? DISABLED_SMS_CONFIG;
+          const toNumber = sms.toNumber;
+          const result = await runAlignmentCheckin({
+            sessionStore: deps.ledger.sessionStore,
+            runId,
+            now,
+            smsConfig: sms,
+            sendTextImpl:
+              sms.enabled && toNumber !== null
+                ? (body: string) => sendImessageText({ to: toNumber, body })
+                : undefined,
+            postImpl: async ({
+              channel,
+              content,
+            }: {
+              channel: string;
+              content: string;
+            }) => {
+              const r = await postToChannel({
+                adapter: deps.adapter,
+                channel,
+                content,
+              });
+              return { messageId: r.messageId };
+            },
+          });
+          logInfo(
+            `alignment-checkin: runId=${runId} action=${result.action} smsSent=${String(result.smsSent)} count=${String(result.countToday)}`,
+          );
+          return;
+        }
+
         const result = await runHabitCheckin({
           sessionStore: deps.ledger.sessionStore,
           adapter: deps.adapter,
@@ -481,6 +545,31 @@ export async function bootstrap(): Promise<BootstrapResult> {
   });
   logInfo(`habits seeded`);
 
+  // SMS/iMessage text-escalation config (fail-fast inside the loader if
+  // SMS_ENABLED=true but misconfigured). Only when enabled do we seed the
+  // daily-alignment habit + register its morning cron — a default deployment
+  // is byte-for-byte unchanged.
+  const smsConfig = loadSmsConfigFromEnv();
+  if (smsConfig.enabled) {
+    const alignmentCron = process.env.ALIGNMENT_CRON ?? "0 9 * * *";
+    // v1 reuses the morning-row Discord channel for proof submission so the
+    // listener (which only watches the seed channels) sees the answers; the
+    // shape pre-filter disambiguates a photo (row) from structured text
+    // (alignment). A dedicated channel is a documented v2 follow-up.
+    seedAlignmentHabit(db, {
+      channelId: channelIds["morning-row"],
+      cronExpr: alignmentCron,
+    });
+    const masked = smsConfig.toNumber
+      ? `••••${smsConfig.toNumber.slice(-4)}`
+      : "(no number)";
+    logInfo(
+      `daily-alignment seeded (SMS on): cron="${alignmentCron}" → ${masked}, cap=${String(smsConfig.maxPerDay)}/day`,
+    );
+  } else {
+    logInfo(`daily-alignment NOT seeded (SMS_ENABLED is not true)`);
+  }
+
   // Construct + log in Discord adapter. Wait for the gateway 'ready' event so
   // that subsequent posts via client.channels.fetch() don't race the
   // WebSocket connection setup.
@@ -548,6 +637,7 @@ export async function bootstrap(): Promise<BootstrapResult> {
     adapter,
     sessionId,
     concept2: safeConcept2,
+    sms: smsConfig,
   });
 
   // Phase 4: chat fall-through. Invoked by the listener (and the catch-up

@@ -462,6 +462,15 @@ function filterRunsByMessageShape(
         return false;
       }
     }
+    if (proofType === "alignment_text") {
+      // A daily-alignment proof is a structured answer to the four questions.
+      // Require >= 2 of the question markers so an idle chat message in the
+      // same channel falls through to chat instead of being judged + rejected.
+      // The Claude judge then enforces substantive answers to all four.
+      const markers = ["avoid", "start", "win", "interfer"];
+      const hits = markers.filter((m) => lowerText.includes(m)).length;
+      return hits >= 2;
+    }
     return false;
   });
 }

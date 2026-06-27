@@ -225,3 +225,41 @@ export function seedHabits(
 
   seedTx(seeds);
 }
+
+/**
+ * Seed (or replace) the daily-alignment habit row. Kept SEPARATE from
+ * `seedHabits` and called by bootstrap ONLY when SMS is enabled, so a default
+ * deployment that hasn't opted into the text-escalation feature gets exactly
+ * the original three habits and no behaviour change.
+ *
+ * Unlike the sensor habits, alignment uses neither why-wells (its escalation
+ * copy is fixed, not Claude-generated) nor a proof_config (its proof is judged
+ * by `verifyAlignment`), so both JSON columns are empty objects. `domain` is
+ * "alignment" — the sentinel the dispatch switch uses to route escalations to
+ * `runAlignmentCheckin` and that is absent from `DOMAIN_TO_CHANNEL`, so it
+ * delivers via the raw `channel_id` snowflake.
+ *
+ * Idempotent: INSERT OR REPLACE keyed on the fixed id "daily-alignment".
+ */
+export function seedAlignmentHabit(
+  db: Database.Database,
+  opts: { readonly channelId: string; readonly cronExpr: string },
+): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO habits (
+      id, name, domain, cron_expr, why_stakes_json,
+      proof_type, proof_config_json, channel_id, active, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "daily-alignment",
+    "Daily alignment",
+    "alignment",
+    opts.cronExpr,
+    "{}",
+    "alignment_text",
+    "{}",
+    opts.channelId,
+    1,
+    Date.now(),
+  );
+}
