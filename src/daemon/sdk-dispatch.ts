@@ -19,6 +19,7 @@
 // References:
 
 import { spawnSync } from "node:child_process";
+import type { DispatchAuthMode } from "./dispatch-diagnostics.js";
 import { query as anthropicQuery, AbortError } from "@anthropic-ai/claude-agent-sdk";
 
 export type DispatchModel = "claude-opus-4-7" | "claude-sonnet-4-6" | "claude-haiku-4-5-20251001";
@@ -47,11 +48,39 @@ export interface DispatchResult {
   readonly stderr: string;
   readonly durationMs: number;
   readonly dryRun: boolean;
+  /** Which credential path this invocation actually used. Recorded so a
+   *  failure can be attributed to the right account without guessing. */
+  readonly authMode: DispatchAuthMode;
+}
+
+/**
+ * Which authentication path dispatch uses, from `HABIT_AUTH_MODE`.
+ *
+ * "bare" (the default, and the historical behaviour) passes `--bare`, which
+ * forces API-key auth via ANTHROPIC_API_KEY. "subscription" omits `--bare` and
+ * lets the CLI use the operator's normal Claude credentials.
+ *
+ * The source comment here used to assert that subscription auth "isn't
+ * reliable for a daemon" because a launchd job cannot read keychain OAuth
+ * tokens. That was never measured, and on 2026-07-31 it was tested directly: a
+ * probe running in the same user launchd domain, same HOME, same PATH, same
+ * working directory and with no TTY completed successfully 4 times out of 4,
+ * returning valid --json-schema structured output. The assumption was wrong,
+ * and it had kept the daemon pinned to an API key whose account had no credit
+ * for ten weeks.
+ */
+export function resolveAuthMode(
+  env: NodeJS.ProcessEnv = process.env,
+): DispatchAuthMode {
+  return env["HABIT_AUTH_MODE"] === "subscription"
+    ? "subscription"
+    : "api_key_bare";
 }
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 
 function buildDryRunStub(opts: DispatchOpts): DispatchResult {
+  const authMode = resolveAuthMode();
   // Return a JSON envelope shaped like what `claude -p --output-format json`
   // would emit on success. The structured_output is a minimal CLEAN footer.
   const stubEnvelope = {
@@ -89,6 +118,7 @@ function buildDryRunStub(opts: DispatchOpts): DispatchResult {
     stderr: "",
     durationMs: 1,
     dryRun: true,
+    authMode,
   };
 }
 
@@ -124,6 +154,7 @@ function buildSandboxDispatchEnv(opts: DispatchOpts): NodeJS.ProcessEnv {
 }
 
 function dispatchClaudeViaSandbox(opts: DispatchOpts): DispatchResult {
+  const authMode = resolveAuthMode();
   const projectRoot = process.env.PROJECT_ROOT ?? process.cwd();
   const runDispatchPath = `${projectRoot}/scripts/sandbox/run-dispatch.sh`;
   const start = Date.now();
@@ -143,6 +174,7 @@ function dispatchClaudeViaSandbox(opts: DispatchOpts): DispatchResult {
       stderr: result.stderr ?? result.error.message,
       durationMs,
       dryRun: false,
+      authMode,
     };
   }
   if (result.signal === "SIGTERM" || result.signal === "SIGKILL") {
@@ -153,6 +185,7 @@ function dispatchClaudeViaSandbox(opts: DispatchOpts): DispatchResult {
       stderr: result.stderr ?? "",
       durationMs,
       dryRun: false,
+      authMode,
     };
   }
   return {
@@ -162,6 +195,7 @@ function dispatchClaudeViaSandbox(opts: DispatchOpts): DispatchResult {
     stderr: result.stderr ?? "",
     durationMs,
     dryRun: false,
+    authMode,
   };
 }
 
@@ -198,9 +232,12 @@ export function dispatchClaude(opts: DispatchOpts): DispatchResult {
   // dispatch session 417409d4 tool_result trace. The model improvised work
   // without the skill protocol's mechanical checks (15-grep audit, etc.).
   // user,project restores skill resolution while keeping StructuredOutput.
+  const authMode = resolveAuthMode();
   const args: string[] = [
     "claude",
-    "--bare",
+    // --bare forces API-key auth. Omitted under HABIT_AUTH_MODE=subscription so
+    // the CLI uses the operator's normal Claude credentials instead.
+    ...(authMode === "api_key_bare" ? ["--bare"] : []),
     "--output-format",
     "json",
     "--json-schema",
@@ -236,16 +273,26 @@ export function dispatchClaude(opts: DispatchOpts): DispatchResult {
   // passing env: process.env, behaviour depends on Node's default-inherit
   // contract; making it explicit also lets a future env-stripping change
   // here be visible.
-  if (process.env.ANTHROPIC_API_KEY === undefined) {
+  if (authMode === "api_key_bare" && process.env.ANTHROPIC_API_KEY === undefined) {
     process.stderr.write(
       `[dispatch-claude] WARNING: ANTHROPIC_API_KEY missing from process.env — claude --bare will fail auth\n`,
     );
   }
+  // Under subscription auth the API key must be ABSENT from the child's
+  // environment, not merely unused: the CLI will pick up ANTHROPIC_API_KEY on
+  // its own even without --bare, which would silently route back to the
+  // no-credit account this change exists to stop using. Verified 2026-07-31 —
+  // the launchd probe only succeeded with the key unset.
+  const childEnv: NodeJS.ProcessEnv = { ...process.env };
+  if (authMode === "subscription") {
+    delete childEnv["ANTHROPIC_API_KEY"];
+  }
+
   const start = Date.now();
   const result = spawnSync("/usr/bin/env", args, {
     cwd: opts.cwd,
     encoding: "utf8",
-    env: process.env,
+    env: childEnv,
     stdio: ["ignore", "pipe", "pipe"],
     timeout: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
   });
@@ -259,6 +306,7 @@ export function dispatchClaude(opts: DispatchOpts): DispatchResult {
       stderr: result.stderr ?? result.error.message,
       durationMs,
       dryRun: false,
+      authMode,
     };
   }
   if (result.signal === "SIGTERM" || result.signal === "SIGKILL") {
@@ -269,6 +317,7 @@ export function dispatchClaude(opts: DispatchOpts): DispatchResult {
       stderr: result.stderr ?? "",
       durationMs,
       dryRun: false,
+      authMode,
     };
   }
   return {
@@ -278,5 +327,6 @@ export function dispatchClaude(opts: DispatchOpts): DispatchResult {
     stderr: result.stderr ?? "",
     durationMs,
     dryRun: false,
+    authMode,
   };
 }

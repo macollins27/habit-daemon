@@ -47,6 +47,29 @@ function err(line: string): void {
   process.stderr.write(line + "\n");
 }
 
+// ---------------------------------------------------------------------------
+// Injected dependency hooks.
+//
+// `probe` runs ONE trivial Claude call to test recovery — never a habit run,
+// so no check-in of the operator's is spent discovering whether the API is
+// back. `notify` posts a deterministic, Claude-free alert to the configured
+// channel. Both default to no-ops so tests and minimal schemas stay isolated;
+// bootstrap wires the real implementations.
+// ---------------------------------------------------------------------------
+export type DependencyProbeFn = () => Promise<boolean>;
+export type DependencyNotifyFn = (text: string) => Promise<void>;
+
+let probeImpl: DependencyProbeFn = async () => false;
+let notifyImpl: DependencyNotifyFn = async () => undefined;
+
+export function setDependencyHooks(hooks: {
+  readonly probe?: DependencyProbeFn;
+  readonly notify?: DependencyNotifyFn;
+}): void {
+  if (hooks.probe !== undefined) probeImpl = hooks.probe;
+  if (hooks.notify !== undefined) notifyImpl = hooks.notify;
+}
+
 // -----------------------------------------------------------------------------
 // Escalation dispatch backoff (incident 2026-06-02).
 //
@@ -56,6 +79,19 @@ function err(line: string): void {
 // scheduler now backs a failing escalation off exponentially, resets on
 // success, and trips a circuit breaker when failures are systemic.
 // -----------------------------------------------------------------------------
+
+import {
+  buildPauseAlert,
+  buildResumeAlert,
+  evaluateDispatchGate,
+  isGlobalOutage,
+  markAlertSent,
+  pauseAiDependency,
+  readAiDependency,
+  recordFailedProbe,
+  resumeAiDependency,
+} from "./ai-dependency.js";
+import { summariseDispatch, type DispatchDiagnostic } from "./dispatch-diagnostics.js";
 
 export const ESCALATION_BACKOFF_BASE_MS = 60_000; // 1 minute
 export const ESCALATION_BACKOFF_MAX_MS = 6 * 60 * 60 * 1000; // 6 hours
@@ -68,6 +104,8 @@ export const ESCALATION_CIRCUIT_BREAKER_THRESHOLD = 3;
  * amount of backoff will fix.
  */
 export const MAX_ESCALATION_ATTEMPTS = 8;
+/** Upper bound on the diagnostic string persisted to `last_dispatch_error`. */
+export const DISPATCH_ERROR_PERSIST_LIMIT = 2_000;
 /** First cooldown after the breaker opens; doubles per failed probe up to max. */
 export const ESCALATION_BREAKER_BASE_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
 export const ESCALATION_BREAKER_MAX_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6 hours
@@ -268,9 +306,14 @@ function recordEscalationFailure(
   nowMs: number,
 ): void {
   const newCount = row.escalation_failure_count + 1;
+  // 2026-07-31: this was `.slice(0, 500)`. Combined with the dispatcher's own
+  // 600-char truncation it guaranteed that the reason a run failed could never
+  // reach the ledger. The message is now a structured, cause-first diagnostic
+  // (see dispatch-diagnostics.ts); the bound exists only to stop an unbounded
+  // blob reaching the database, and sits well clear of a full diagnostic line.
   const msg = (error instanceof Error ? error.message : String(error)).slice(
     0,
-    500,
+    DISPATCH_ERROR_PERSIST_LIMIT,
   );
   if (newCount >= MAX_ESCALATION_ATTEMPTS) {
     db.prepare(
@@ -402,6 +445,21 @@ async function dispatchEscalation(
     return true;
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
+    const diagnostic = diagnosticFromDispatchError(msg);
+
+    // An ACCOUNT-WIDE fault must not be charged to this run. The 2026 outage
+    // parked 135 runs because one billing failure was billed to each of them
+    // eight times over. When the cause is global the run keeps its level, its
+    // schedule and its full retry budget; only the global state changes.
+    if (diagnostic !== null && isGlobalOutage(diagnostic)) {
+      err(
+        `[scheduler] GLOBAL dependency failure (${diagnostic.errorCategory}) on run ` +
+          `${row.id} — pausing all dispatch; run keeps its retry budget`,
+      );
+      pauseAiDependency(db, diagnostic, nowMs);
+      return false;
+    }
+
     err(
       `[scheduler] habit-checkin dispatch FAILED for run ${row.id}: ${msg.slice(0, 500)} ` +
         `(failure #${String(row.escalation_failure_count + 1)})`,
@@ -409,6 +467,42 @@ async function dispatchEscalation(
     recordEscalationFailure(db, row, e, nowMs);
     return false;
   }
+}
+
+/**
+ * The dispatcher throws an Error whose message is the formatted diagnostic
+ * (see dispatch-diagnostics.ts). Recover the category from it so the scheduler
+ * can tell an account-wide outage from a broken run without re-running Claude.
+ */
+/**
+ * The dispatcher throws an Error whose message is the formatted diagnostic
+ * (see dispatch-diagnostics.ts, `formatDiagnostic`): the CATEGORY comes first,
+ * then a quoted cause, then `auth=...`. Recover enough of it here to decide
+ * global-vs-per-run without re-invoking Claude — the whole point being that the
+ * component reporting a Claude failure must not itself need Claude.
+ */
+export function diagnosticFromDispatchError(
+  message: string,
+): DispatchDiagnostic | null {
+  const category = (message.split("|")[0] ?? "").trim();
+  if (category.length === 0) return null;
+  const quoted = /"([^"]{1,300})"/.exec(message);
+  const apiStatus = /api_status=(\d{3})/.exec(message);
+  return {
+    at: new Date().toISOString(),
+    authMode: message.includes("auth=subscription") ? "subscription" : "api_key_bare",
+    status: "failed",
+    exitCode: 1,
+    terminalReason: null,
+    apiErrorStatus: apiStatus === null ? null : Number(apiStatus[1]),
+    resultSummary: quoted === null ? null : (quoted[1] ?? null),
+    errorCategory: category as DispatchDiagnostic["errorCategory"],
+    modelRequestBegan: message.includes("model_request_began=true"),
+    inputTokens: null,
+    outputTokens: null,
+    durationMs: null,
+    rawTail: null,
+  };
 }
 
 /**
@@ -460,6 +554,25 @@ async function tickHabitRunEscalations(
   dispatch: DispatchFn,
   nowMs: number,
 ): Promise<void> {
+  // GLOBAL GATE. When the AI dependency is known-down, no run is dispatched and
+  // no run spends any retry budget. Only a single controlled probe may run, and
+  // only once its backoff has elapsed. This is the check whose absence turned
+  // one billing failure into 135 permanently parked check-ins.
+  const gate = evaluateDispatchGate(db, nowMs);
+  if (!gate.allowed) {
+    if (!gate.probeDue) return;
+    err("[scheduler] AI dependency paused — running one controlled recovery probe");
+    const healthy = await probeImpl();
+    if (healthy) {
+      err("[scheduler] recovery probe SUCCEEDED — resuming habit dispatch");
+      resumeAiDependency(db, nowMs);
+      await notifyImpl(buildResumeAlert());
+    } else {
+      recordFailedProbe(db, nowMs);
+      return;
+    }
+  }
+
   const due = listDueHabitRuns(db, nowMs);
   if (due.length === 0) return;
 

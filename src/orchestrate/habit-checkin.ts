@@ -36,6 +36,12 @@
 //   - src/lib/prompt-templates/level-1.ts (L1 voice + schema)
 //   - src/orchestrate/vision-rejection-counter.ts (sets the callout flag)
 
+import {
+  beginDelivery,
+  completeDelivery,
+  deliveryKey,
+  readDelivery,
+} from "../daemon/delivery-ledger.js";
 import { z } from "zod";
 import type Database from "better-sqlite3";
 import type { SessionStore, SessionEventRow } from "../daemon/session-store.js";
@@ -1027,11 +1033,36 @@ export async function runHabitCheckin(
     domain: habit.domain,
     channel_id: habitRow.channel_id,
   });
-  const postResult = await postImpl({
-    adapter,
-    channel: channelName,
-    content: messageText,
-  });
+  // DUPLICATE PROTECTION (2026-07-31). The post is irreversible and Discord
+  // offers no idempotency key, so intent is claimed locally FIRST. A crash
+  // between the post and the state writes below leaves the claim 'in_flight',
+  // and the next attempt is told the outcome is unknown instead of cheerfully
+  // posting the same escalation a second time.
+  const claim = beginDelivery(db, runId, currentLevel, now, `pid-${String(process.pid)}`);
+  if (claim === "in_doubt") {
+    throw new Error(
+      `habit-checkin delivery ${deliveryKey(runId, currentLevel)} is IN DOUBT — a ` +
+        `previous attempt died mid-post and it is not known whether the message ` +
+        `was sent. Refusing to re-post. Reconcile against channel history, then ` +
+        `resolve it with resolveInDoubtDelivery().`,
+    );
+  }
+
+  let postResult: { messageId: string };
+  if (claim === "already_delivered") {
+    // The message went out; only the local state writes were lost. Skip the
+    // post and let the transaction below advance the run, which is what
+    // converts a would-be duplicate into a single correct delivery.
+    const prior = readDelivery(db, runId, currentLevel);
+    postResult = { messageId: prior?.message_id ?? "" };
+  } else {
+    postResult = await postImpl({
+      adapter,
+      channel: channelName,
+      content: messageText,
+    });
+    completeDelivery(db, runId, currentLevel, postResult.messageId, now);
+  }
 
   // Phase 6.1: record the Discord message id of this escalation so the
   // completion path can post a follow-up referencing it when a later

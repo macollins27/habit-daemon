@@ -53,6 +53,7 @@ import {
   type MessageMatch,
 } from "../lib/discord-adapter.js";
 import type { Message } from "discord.js";
+import { formatDiagnostic, summariseDispatch } from "./dispatch-diagnostics.js";
 import { dispatchClaude } from "./sdk-dispatch.js";
 import { parseClaudeEnvelope } from "./verify-footer.js";
 import {
@@ -225,7 +226,10 @@ async function dispatchClaudeForCheckin(opts: {
   });
   if (result.status !== "success" && result.status !== "dry_run") {
     return {
-      error: `claude -p exited ${result.status} (code=${result.exitCode}): stderr=${(result.stderr ?? "").slice(0, 600)} | stdout=${(result.stdout ?? "").slice(0, 600)}`,
+      // 2026-07-31: was a blind 600-char slice of stderr+stdout. The failing
+      // invocation writes nothing to stderr and the cause sits at char 670 of
+      // the stdout envelope, so the slice hid ten weeks of outage. Parse it.
+      error: formatDiagnostic(summariseDispatch(result, result.authMode)),
     };
   }
   const env = parseClaudeEnvelope(result.stdout);
@@ -268,7 +272,7 @@ async function dispatchClaudeForChat(opts: {
   });
   if (result.status !== "success" && result.status !== "dry_run") {
     throw new Error(
-      `claude -p exited ${result.status} (code=${result.exitCode}): stderr=${(result.stderr ?? "").slice(0, 600)} | stdout=${(result.stdout ?? "").slice(0, 600)}`,
+      formatDiagnostic(summariseDispatch(result, result.authMode)),
     );
   }
   const env = parseClaudeEnvelope(result.stdout);
